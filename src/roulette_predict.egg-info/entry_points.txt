@@ -1,0 +1,2 @@
+[console_scripts]
+roulette-predict = roulette_predict.__main__:main
