@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional, Tuple
 
 import numpy as np
@@ -58,9 +59,10 @@ def _contour_passes_ball_geometry(
     if r_enc < r_lo * 0.78 or r_enc > r_hi * 1.22:
         return False
     asp = max(bw_, bh_) / float(max(1, min(bw_, bh_)))
-    if asp > 1.58:
+    # Rim glints / specular streaks are elongated; the ball stays compact.
+    if asp > 1.48:
         return False
-    if circ < 0.45:
+    if circ < 0.48:
         return False
     if solidity < 0.68:
         return False
@@ -203,10 +205,64 @@ def wheel_center_radius_in_ball_roi(
     return cx, cy, r
 
 
+def ball_orbit_inner_radius_px(wheel_r_px: float) -> float:
+    """
+    Inner radius of the track annulus: hub, number ring, and inner bowl stay **outside** the band.
+    Kept large enough that the ball track (outer rim) stays valid; Step-2 paint should lie on the tube.
+    """
+    r = max(float(wheel_r_px), 8.0)
+    return max(8.0, r * 0.40)
+
+
+def centroid_in_track_annulus(
+    x: float, y: float, wheel_cx: float, wheel_cy: float, wheel_r_px: float
+) -> bool:
+    """
+    True if (x,y) lies in the same radial band as the ball-orbit mask (not hub, not outside wheel).
+    Prevents locking onto the center spindle or inner wooden bowl.
+    """
+    r = max(float(wheel_r_px), 8.0)
+    r_in = ball_orbit_inner_radius_px(wheel_r_px)
+    radial = math.hypot(x - wheel_cx, y - wheel_cy)
+    return r_in <= radial <= r * 1.12
+
+
+def centroid_on_step2_track_mask(x: float, y: float, track_region: np.ndarray) -> bool:
+    """
+    True if the rounded pixel lies on the strict geometry mask: annulus ∩ Step-2 tube ∩ Step-1 wheel disk.
+    Rejects any centroid that drifts onto the golden hub / inner wheel even if radial checks slip.
+    """
+    if track_region.size == 0:
+        return False
+    h, w = track_region.shape[:2]
+    ix = int(np.clip(round(x), 0, w - 1))
+    iy = int(np.clip(round(y), 0, h - 1))
+    return int(track_region[iy, ix]) > 127
+
+
+def centroid_near_step2_track_mask(
+    x: float, y: float, track_region: np.ndarray, *, radius_px: int = 5
+) -> bool:
+    """
+    True if any pixel within Chebyshev distance ``radius_px`` of (x,y) lies on the track mask.
+    Flow/HSV centroids can sit slightly off the exact paint stroke; this avoids dropping valid tracks.
+    """
+    if track_region.size == 0:
+        return False
+    h, w = track_region.shape[:2]
+    cx = int(np.clip(round(x), 0, w - 1))
+    cy = int(np.clip(round(y), 0, h - 1))
+    r = max(0, int(radius_px))
+    y0, y1 = max(0, cy - r), min(h, cy + r + 1)
+    x0, x1 = max(0, cx - r), min(w, cx + r + 1)
+    patch = track_region[y0:y1, x0:x1]
+    return bool(np.any(patch > 127))
+
+
 def track_annulus_mask_from_wheel_radius(h: int, w: int, wheel_cx: float, wheel_cy: float, wheel_r_px: float) -> np.ndarray:
     """Ball-orbit band in ball-path ROI pixels (same geometry as tracking)."""
     r = max(float(wheel_r_px), 8.0)
-    r_in = max(5.0, r * 0.24)
+    r_in = ball_orbit_inner_radius_px(wheel_r_px)
     r_out = r * 0.995
     return _annulus_mask(h, w, wheel_cx, wheel_cy, r_in, r_out)
 
@@ -355,7 +411,8 @@ def ball_track_mask_and_centroid(
     min_a = max(12.0, img_area * 0.00005)
     # Pocket text / merged ink often forms a much larger blob than the ball; cap harder for manual HSV.
     max_a_default = img_area * 0.12
-    max_a_manual = min(max_a_default, img_area * 0.065)
+    # Cap area so merged glare + path smears lose to the real ball-sized blob.
+    max_a_manual = min(max_a_default, img_area * 0.052)
 
     def best_ball_centroid(
         mask: np.ndarray,
@@ -417,7 +474,8 @@ def ball_track_mask_and_centroid(
             if anchor_xy is not None and anchor_weight > 0.0:
                 ax, ay = anchor_xy
                 d = float(np.hypot(cx - ax, cy - ay)) / (diag + 1e-6)
-                score += anchor_weight * (1.0 - min(d * 2.8, 1.0))
+                # Strong locality: stray highlights far from last position lose vs the ball.
+                score += anchor_weight * (1.0 - min(d * 4.0, 1.0))
             if score > best_score:
                 best_score = score
                 best_c = (cx, cy)
@@ -479,3 +537,154 @@ def ball_track_mask_and_centroid(
     if cent_a is not None:
         return auto, cent_a, True
     return manual, cent_m, False
+
+
+def find_white_ball_centroid_near_click_for_pick(
+    ball_bgr: np.ndarray,
+    wheel_cx: float,
+    wheel_cy: float,
+    wheel_r_px: float,
+    click_roi_x: float,
+    click_roi_y: float,
+    tube_mask: Optional[np.ndarray],
+) -> Optional[Tuple[float, float]]:
+    """
+    After a coarse click on/near the tube, find the nearest plausible white-ball blob in the
+    track annulus ∩ path tube. Returns blob centroid in ball-ROI pixels, or None to fall back to click.
+    """
+    import cv2
+
+    if ball_bgr.size == 0:
+        return None
+    h, w = ball_bgr.shape[:2]
+    region = _region_annulus_tube_disk(h, w, wheel_cx, wheel_cy, wheel_r_px, tube_mask)
+    white = _white_ball_mask_bgr(ball_bgr)
+    m = cv2.bitwise_and(white, region)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+    if np.count_nonzero(m) < 12:
+        return None
+    contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    img_area = float(h * w)
+    min_a = max(12.0, img_area * 0.00005)
+    max_a = min(img_area * 0.065, img_area * 0.12)
+    max_pick_dist = float(min(max(140.0, 0.38 * min(h, w)), 0.48 * min(h, w)))
+    best: Optional[Tuple[float, float]] = None
+    best_d = 1e18
+    for c in contours:
+        a = float(cv2.contourArea(c))
+        if a < min_a or a > max_a:
+            continue
+        perim = cv2.arcLength(c, True)
+        if perim < 1e-3:
+            continue
+        circ = 4.0 * np.pi * a / (perim * perim)
+        x, y, bw_, bh_ = cv2.boundingRect(c)
+        extent = a / float(max(1, bw_ * bh_))
+        (_, _), r_enc = cv2.minEnclosingCircle(c)
+        hull = cv2.convexHull(c)
+        hull_a = float(cv2.contourArea(hull))
+        solidity = a / (hull_a + 1e-6)
+        if not _contour_passes_ball_geometry(
+            a=a,
+            circ=circ,
+            extent=extent,
+            solidity=solidity,
+            bw_=bw_,
+            bh_=bh_,
+            r_enc=float(r_enc),
+            wheel_r_px=wheel_r_px,
+            h=h,
+            w=w,
+        ):
+            continue
+        mom = cv2.moments(c)
+        if mom["m00"] < 1e-6:
+            continue
+        cx = float(mom["m10"] / mom["m00"])
+        cy = float(mom["m01"] / mom["m00"])
+        if not centroid_in_track_annulus(cx, cy, wheel_cx, wheel_cy, wheel_r_px):
+            continue
+        d = float(np.hypot(cx - click_roi_x, cy - click_roi_y))
+        if d > max_pick_dist:
+            continue
+        if d < best_d:
+            best_d = d
+            best = (cx, cy)
+    return best
+
+
+def find_moving_ball_centroid_near_click_for_pick(
+    prev_bgr: np.ndarray,
+    curr_bgr: np.ndarray,
+    wheel_cx: float,
+    wheel_cy: float,
+    wheel_r_px: float,
+    click_roi_x: float,
+    click_roi_y: float,
+    tube_mask: Optional[np.ndarray],
+) -> Optional[Tuple[float, float]]:
+    """
+    Two frames ~50–70 ms apart: threshold |curr−prev| in grayscale, restrict to tube ∩ annulus,
+    prefer overlap with bright (ball-like) pixels on **curr**. Pick the moving blob whose centroid
+    is nearest the click — targets the spinning ball instead of static rim highlights.
+    """
+    import cv2
+
+    if prev_bgr.size == 0 or curr_bgr.size == 0:
+        return None
+    if prev_bgr.shape != curr_bgr.shape:
+        return None
+    h, w = curr_bgr.shape[:2]
+    gp = cv2.cvtColor(prev_bgr, cv2.COLOR_BGR2GRAY)
+    gc = cv2.cvtColor(curr_bgr, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(gc, gp)
+    _, motion = cv2.threshold(diff, 12, 255, cv2.THRESH_BINARY)
+    region = _region_annulus_tube_disk(h, w, wheel_cx, wheel_cy, wheel_r_px, tube_mask)
+    motion = cv2.bitwise_and(motion, region)
+    white = _white_ball_mask_bgr(curr_bgr)
+    # Prefer motion that is also bright (ball); if that erases everything, use motion alone.
+    tight = cv2.bitwise_and(motion, white)
+    if np.count_nonzero(tight) >= 20:
+        motion = tight
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, k, iterations=1)
+    motion = cv2.morphologyEx(motion, cv2.MORPH_CLOSE, k, iterations=1)
+    if np.count_nonzero(motion) < 16:
+        return None
+    contours, _ = cv2.findContours(motion, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    img_area = float(h * w)
+    min_a = max(8.0, img_area * 0.00004)
+    max_a = min(img_area * 0.09, img_area * 0.15)
+    max_pick_dist = float(min(max(160.0, 0.42 * min(h, w)), 0.52 * min(h, w)))
+    best: Optional[Tuple[float, float]] = None
+    best_d = 1e18
+    for c in contours:
+        a = float(cv2.contourArea(c))
+        if a < min_a or a > max_a:
+            continue
+        perim = cv2.arcLength(c, True)
+        if perim < 1e-3:
+            continue
+        circ = 4.0 * np.pi * a / (perim * perim)
+        if circ < 0.25:
+            continue
+        mom = cv2.moments(c)
+        if mom["m00"] < 1e-6:
+            continue
+        cx = float(mom["m10"] / mom["m00"])
+        cy = float(mom["m01"] / mom["m00"])
+        if not centroid_in_track_annulus(cx, cy, wheel_cx, wheel_cy, wheel_r_px):
+            continue
+        d = float(np.hypot(cx - click_roi_x, cy - click_roi_y))
+        if d > max_pick_dist:
+            continue
+        if d < best_d:
+            best_d = d
+            best = (cx, cy)
+    return best

@@ -12,6 +12,11 @@ MOTION_BLUR_MAX_MAG_TRIGGER = 6.5
 MAG_PERCENTILE_NORMAL = 58.0
 MAG_PERCENTILE_BLUR = 40.0
 
+# Real-time budget: default OpenCV Farneback( levels=5, winsize=41 ) is heavy on large ball ROIs.
+# Slightly fewer levels + smaller window cuts CPU with modest impact on fast-spin tracking.
+FARNEBACK_PYR_LEVELS = 4
+FARNEBACK_WINSIZE = 35
+
 
 def preprocess_ball_gray(gray: np.ndarray) -> np.ndarray:
     """Grayscale frame with light Gaussian blur to suppress sensor noise before Farneback."""
@@ -48,7 +53,7 @@ def track_centroid_farneback_path_tube(
     wheel_cy: float,
     path_tube_mask: np.ndarray,
     *,
-    min_weight_sum: float = 180.0,
+    min_weight_sum: float = 130.0,
     min_pixels: int = 28,
 ) -> Optional[Tuple[float, float]]:
     """
@@ -82,8 +87,8 @@ def track_centroid_farneback_path_tube(
         curr_prep,
         None,
         0.5,
-        5,
-        41,
+        FARNEBACK_PYR_LEVELS,
+        FARNEBACK_WINSIZE,
         3,
         7,
         1.5,
@@ -107,7 +112,8 @@ def track_centroid_farneback_path_tube(
 
     max_roi_mag = float(np.max(mag_f[roi]))
     # Near-static ROI: no meaningful motion → do not lock onto texture/noise outside the moving ball.
-    if max_roi_mag < 0.38:
+    # Too strict a floor drops flow on dim video / 60 Hz timing; HSV fallback still applies in worker.
+    if max_roi_mag < 0.26:
         return None
     mag_percentile = (
         MAG_PERCENTILE_BLUR if max_roi_mag >= MOTION_BLUR_MAX_MAG_TRIGGER else MAG_PERCENTILE_NORMAL

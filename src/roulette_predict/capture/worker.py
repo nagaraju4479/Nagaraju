@@ -21,8 +21,11 @@ from roulette_predict.vision.ball_track import (
     annulus_path_tube_mask_ball_roi,
     ball_path_hsv_preview_mask,
     ball_track_mask_and_centroid,
+    centroid_in_track_annulus,
+    centroid_near_step2_track_mask,
     mask_keep_blob_at_tracked_centroid,
     path_tube_mask_ball_roi,
+    track_region_mask_ball_roi,
     wheel_center_radius_in_ball_roi,
 )
 from roulette_predict.vision.hsv_mask import apply_hsv_mask_bgr
@@ -64,6 +67,21 @@ def _monitor_for_cal(cal: CalibrationData, sct) -> dict:
     mons = sct.monitors
     idx = cal.monitor_index if 1 <= cal.monitor_index < len(mons) else 1
     return dict(mons[idx])
+
+
+def _screen_union_rect(
+    a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+) -> Tuple[int, int, int, int]:
+    """Smallest axis-aligned rect containing both ``(left, top, width, height)`` screen ROIs."""
+    al, at, aw, ah = a
+    bl, bt, bw, bh = b
+    ar, ab = al + aw, at + ah
+    br, bb = bl + bw, bt + bh
+    ul = min(al, bl)
+    ut = min(at, bt)
+    ur = max(ar, br)
+    ub = max(ab, bb)
+    return ul, ut, max(1, ur - ul), max(1, ub - ut)
 
 
 def _wheel_roi_mon(cal: CalibrationData, mon: dict) -> Optional[Tuple[int, int, int, int]]:
@@ -125,6 +143,51 @@ def ocr_roi(cal: CalibrationData) -> Optional[Tuple[int, int, int, int]]:
     return _ocr_roi_mon(cal, mon)
 
 
+def snapshot_ball_path_bgr_and_geometry(
+    cal: CalibrationData,
+) -> Optional[Tuple[np.ndarray, int, int, int, int, float, float, float]]:
+    """
+    Single grab of the full ball-path ROI plus wheel center/radius in ball-ROI pixels.
+    Used for live color pick (white-ball search + HSV patch) without racing the vision thread.
+    """
+    import mss
+
+    with mss.mss() as sct:
+        mon = _monitor_for_cal(cal, sct)
+        broi = _ball_path_roi_mon(cal, mon)
+        if not broi:
+            return None
+        bl, bt, bw, bh = broi
+        ball_bgr = _grab_region(bl, bt, bw, bh)
+        cx_b, cy_b, r_px = wheel_center_radius_in_ball_roi(cal, mon, bl, bt, bw, bh)
+        return ball_bgr, bl, bt, bw, bh, cx_b, cy_b, r_px
+
+
+# Max width of wheel image for UI + mask preview (full-res ball ROI still used for tracking).
+# Higher = sharper Roulette tab but more CPU per frame.
+WHEEL_PREVIEW_MAX_W = 1280
+
+
+def ball_roi_xy_to_wheel_preview_xy(
+    bx: float,
+    by: float,
+    wheel_pw: int,
+    wheel_ph: int,
+    ww: int,
+    wh: int,
+    wl: int,
+    wt: int,
+    bl: int,
+    bt: int,
+) -> Tuple[int, int]:
+    """Inverse of ``_wheel_preview_xy_to_ball_roi_xy``: ball-path ROI → wheel preview pixels."""
+    wx = float(bx) + (bl - wl)
+    wy = float(by) + (bt - wt)
+    hx = int(max(0, min(wheel_pw - 1, round(wx * wheel_pw / max(1, ww)))))
+    hy = int(max(0, min(wheel_ph - 1, round(wy * wheel_ph / max(1, wh)))))
+    return hx, hy
+
+
 def _wheel_preview_xy_to_ball_roi_xy(
     hx: int,
     hy: int,
@@ -158,7 +221,17 @@ class VisionWorker(QThread):
     status_text = Signal(str)
     ball_omega = Signal(float)
 
-    _WHEEL_PREVIEW_MAX_W = 960
+    _WHEEL_PREVIEW_MAX_W = WHEEL_PREVIEW_MAX_W
+    # Target loop period (ms) — ~60 Hz cap; actual FPS depends on CPU + grab size.
+    _TARGET_LOOP_MS = 16
+    # Run dense Farneback every Nth locked frame to stay near real-time when CPU-bound.
+    _FLOW_DECIMATE_STRIDE = 2
+    # Flow/HSV centroids can sit a few px off the painted stroke; wider = fewer false drops.
+    _TRACK_MASK_NEAR_RADIUS_PX = 8
+    # After a lost centroid, keep drawing the ring at the last good position for a few frames.
+    _RING_COAST_FRAMES = 32
+    # Require this many consecutive misses before switching green → orange (reduces rapid color flicker).
+    _ORANGE_RING_AFTER_MISS_FRAMES = 6
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -167,10 +240,6 @@ class VisionWorker(QThread):
         self._hsv = HsvSettings()
         self._speed_tracker: Optional[SpeedTracker] = None
         self._wheel_center_in_roi: Optional[Tuple[float, float]] = None
-        self._last_wheel_emit_t: float = 0.0
-        self._pick_highlight_xy: Optional[Tuple[int, int]] = None
-        # Ball-path tracking uses this when set; wheel mask still uses `_hsv` (so U-S can stay low).
-        self._ball_hsv_override: Optional[HsvSettings] = None
         # Last good ball centroid in ball-path ROI — continuity vs static rim highlights (ball ROI px).
         self._last_ball_cent_roi: Optional[Tuple[float, float]] = None
         # Preprocessed (blurred) grayscale for consecutive Farneback frames.
@@ -179,47 +248,54 @@ class VisionWorker(QThread):
         self._trusted_ball_cent: Optional[Tuple[float, float]] = None
         self._extrap_frames_used: int = 0
         self._last_track_time: float = 0.0
+        self._flow_decimate_tick: int = 0
+        self._viz_cent_miss_streak: int = 0
+        self._ring_coast_frames_left: int = 0
+        self._last_speed_overlay_text: str = ""
 
-    def set_ball_hsv_override(self, hsv: Optional[HsvSettings]) -> None:
-        """Lock ball-track color range (e.g. from wheel click sample). None = use same as wheel sliders."""
-        self._ball_hsv_override = hsv
-        if hsv is None:
-            self._last_ball_cent_roi = None
-            self._prev_ball_prep = None
-            self._trusted_ball_cent = None
-            self._extrap_frames_used = 0
-            self._last_track_time = 0.0
-
-    def set_pick_highlight(self, xy: Optional[Tuple[int, int]]) -> None:
-        """Wheel-preview pixel coords (same as emitted QImage). Cyan ring on wheel + mask."""
-        self._pick_highlight_xy = xy
+    def _emit_speed_overlay(self, text: str) -> None:
+        if text != self._last_speed_overlay_text:
+            self._last_speed_overlay_text = text
+            self.speed_text.emit(text)
 
     def set_calibration(self, cal: Optional[CalibrationData]) -> None:
         self._cal = cal
         self._speed_tracker = None
         self._wheel_center_in_roi = None
-        self._ball_hsv_override = None
         self._last_ball_cent_roi = None
         self._prev_ball_prep = None
         self._trusted_ball_cent = None
         self._extrap_frames_used = 0
         self._last_track_time = 0.0
+        self._flow_decimate_tick = 0
+        self._viz_cent_miss_streak = 0
+        self._ring_coast_frames_left = 0
+        self._last_speed_overlay_text = ""
 
     def set_hsv(self, hsv: HsvSettings) -> None:
         self._hsv = hsv
 
     def run(self) -> None:
+        import mss
+
         self._running = True
-        while self._running:
-            t0 = time.perf_counter()
-            cal = self._cal
-            if cal and cal.wheel_circle and len(cal.ball_path_points) >= 2:
-                self._process_frame(cal)
-            else:
-                self.status_text.emit("Complete calibration to start capture.")
-            elapsed = time.perf_counter() - t0
-            sleep_ms = max(0, int(33 - elapsed * 1000))  # ~30 fps (OCR not on this thread)
-            self.msleep(sleep_ms)
+        sct = mss.mss()
+        try:
+            while self._running:
+                t0 = time.perf_counter()
+                cal = self._cal
+                if cal and cal.wheel_circle and len(cal.ball_path_points) >= 2:
+                    self._process_frame(cal, sct)
+                else:
+                    self.status_text.emit("Complete calibration to start capture.")
+                elapsed = time.perf_counter() - t0
+                sleep_ms = max(0, int(self._TARGET_LOOP_MS - elapsed * 1000))
+                self.msleep(sleep_ms)
+        finally:
+            try:
+                sct.close()
+            except Exception:
+                pass
 
     def request_stop(self) -> None:
         """Signal the capture loop to exit without blocking the GUI thread."""
@@ -238,187 +314,178 @@ class VisionWorker(QThread):
             self._wheel_center_in_roi = (wcx - bl, wcy - bt)
             self._speed_tracker = SpeedTracker.new(self._wheel_center_in_roi[0], self._wheel_center_in_roi[1])
 
-    def _process_frame(self, cal: CalibrationData) -> None:
+    def _process_frame(self, cal: CalibrationData, sct) -> None:
         import cv2
-        import mss
 
-        def grab(sct, left: int, top: int, width: int, height: int) -> np.ndarray:
-            if width < 1 or height < 1:
-                return np.zeros((1, 1, 3), dtype=np.uint8)
-            region = {"left": left, "top": top, "width": width, "height": height}
-            shot = sct.grab(region)
-            return np.asarray(shot)[:, :, :3].copy()
+        mon = _monitor_for_cal(cal, sct)
+        wroi = _wheel_roi_mon(cal, mon)
+        broi = _ball_path_roi_mon(cal, mon)
+        if not wroi or not broi:
+            return
+        wl, wt, ww, wh = wroi
+        bl, bt, bw, bh = broi
+        self._ensure_trackers(cal, mon, bl, bt)
 
-        with mss.mss() as sct:
-            mon = _monitor_for_cal(cal, sct)
-            wroi = _wheel_roi_mon(cal, mon)
-            broi = _ball_path_roi_mon(cal, mon)
-            if not wroi or not broi:
-                return
-            wl, wt, ww, wh = wroi
-            bl, bt, bw, bh = broi
-            self._ensure_trackers(cal, mon, bl, bt)
+        # One screen grab for wheel + ball path — same video instant, half the mss overhead vs two grabs.
+        ul, ut, uuw, uuh = _screen_union_rect(wroi, broi)
+        region = {"left": ul, "top": ut, "width": uuw, "height": uuh}
+        shot = sct.grab(region)
+        full = np.asarray(shot)
+        full_bgr = full[:, :, :3]
+        rwl, rwt = wl - ul, wt - ut
+        rbl, rbt = bl - ul, bt - ut
+        wheel_bgr = np.ascontiguousarray(full_bgr[rwt : rwt + wh, rwl : rwl + ww])
+        ball_bgr = np.ascontiguousarray(full_bgr[rbt : rbt + bh, rbl : rbl + bw])
 
-            wheel_bgr = grab(sct, wl, wt, ww, wh)
-            if ww > self._WHEEL_PREVIEW_MAX_W:
-                nh = max(1, int(wh * (self._WHEEL_PREVIEW_MAX_W / ww)))
-                wheel_bgr = cv2.resize(
-                    wheel_bgr,
-                    (self._WHEEL_PREVIEW_MAX_W, nh),
-                    interpolation=cv2.INTER_AREA,
-                )
-            mask, masked = apply_hsv_mask_bgr(
+        if ww > self._WHEEL_PREVIEW_MAX_W:
+            nh = max(1, int(wh * (self._WHEEL_PREVIEW_MAX_W / ww)))
+            wheel_bgr = cv2.resize(
                 wheel_bgr,
-                self._hsv.l_h,
-                self._hsv.u_h,
-                self._hsv.l_s,
-                self._hsv.u_s,
-                self._hsv.l_v,
-                self._hsv.u_v,
+                (self._WHEEL_PREVIEW_MAX_W, nh),
+                interpolation=cv2.INTER_AREA,
             )
-            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-            ball_bgr = grab(sct, bl, bt, bw, bh)
+        mask, _ = apply_hsv_mask_bgr(
+            wheel_bgr,
+            self._hsv.l_h,
+            self._hsv.u_h,
+            self._hsv.l_s,
+            self._hsv.u_s,
+            self._hsv.l_v,
+            self._hsv.u_v,
+        )
+        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
 
         cx_b, cy_b, r_px = wheel_center_radius_in_ball_roi(cal, mon, bl, bt, bw, bh)
         tune_lower = np.array([self._hsv.l_h, self._hsv.l_s, self._hsv.l_v], dtype=np.uint8)
         tune_upper = np.array([self._hsv.u_h, self._hsv.u_s, self._hsv.u_v], dtype=np.uint8)
-        ball_locked = self._ball_hsv_override is not None
+        lower = tune_lower
+        upper = tune_upper
         bh, bw = ball_bgr.shape[0], ball_bgr.shape[1]
         tube_mask = path_tube_mask_ball_roi(bh, bw, cal)
-        anchor_ball_roi: Optional[Tuple[float, float]] = None
+        track_geom_mask = track_region_mask_ball_roi(bh, bw, cx_b, cy_b, r_px, tube_mask)
 
-        if not ball_locked:
-            # Tuning: darken the track with sliders only — no centroid, no auto-white speckles.
-            bmask_display = ball_path_hsv_preview_mask(
-                ball_bgr, cx_b, cy_b, r_px, tune_lower, tune_upper, tube_mask=tube_mask
-            )
-            cent = None
-            self.speed_text.emit("Tune U-S / HSV on Color tab, then Pick white ball — tracking starts after pick.")
-            self.ball_omega.emit(0.0)
-        else:
-            ball_cfg = self._ball_hsv_override
-            assert ball_cfg is not None
-            lower = np.array([ball_cfg.l_h, ball_cfg.l_s, ball_cfg.l_v], dtype=np.uint8)
-            upper = np.array([ball_cfg.u_h, ball_cfg.u_s, ball_cfg.u_v], dtype=np.uint8)
-            if self._pick_highlight_xy is not None:
-                hx, hy = self._pick_highlight_xy
-                mapped = _wheel_preview_xy_to_ball_roi_xy(
-                    hx,
-                    hy,
-                    wheel_bgr.shape[1],
-                    wheel_bgr.shape[0],
-                    ww,
-                    wh,
-                    wl,
-                    wt,
-                    bl,
-                    bt,
-                    bw,
-                    bh,
-                )
-                if mapped is not None:
-                    anchor_ball_roi = (float(mapped[0]), float(mapped[1]))
+        eff_anchor: Optional[Tuple[float, float]] = None
+        eff_anchor_w = 0.0
+        if self._last_ball_cent_roi is not None:
+            eff_anchor = self._last_ball_cent_roi
+            eff_anchor_w = 0.82
 
-            eff_anchor: Optional[Tuple[float, float]] = None
-            eff_anchor_w = 0.0
-            if self._last_ball_cent_roi is not None:
-                eff_anchor = self._last_ball_cent_roi
-                eff_anchor_w = 0.62
-            elif anchor_ball_roi is not None:
-                eff_anchor = anchor_ball_roi
-                eff_anchor_w = 0.78
-
-            # Locked HSV mask — baseline centroid; dense optical flow fuses for fast spin.
-            bmask_track, cent_hsv, _auto_ball = ball_track_mask_and_centroid(
-                ball_bgr,
+        # Live HSV from Color sliders — baseline centroid; dense optical flow fuses for fast spin.
+        _, cent_hsv, _auto_ball = ball_track_mask_and_centroid(
+            ball_bgr,
+            cx_b,
+            cy_b,
+            r_px,
+            lower,
+            upper,
+            prefer_manual=True,
+            anchor_ball_xy=eff_anchor,
+            anchor_weight=eff_anchor_w,
+            allow_auto_fallback=False,
+            tube_mask=tube_mask,
+        )
+        t_now = time.perf_counter()
+        cent: Optional[Tuple[float, float]] = cent_hsv
+        gray = cv2.cvtColor(ball_bgr, cv2.COLOR_BGR2GRAY)
+        prep = preprocess_ball_gray(gray)
+        flow_roi = annulus_path_tube_mask_ball_roi(bh, bw, cx_b, cy_b, r_px, tube_mask)
+        flow_cent: Optional[Tuple[float, float]] = None
+        self._flow_decimate_tick += 1
+        run_farneback = (
+            self._flow_decimate_tick % self._FLOW_DECIMATE_STRIDE == 0
+            and self._prev_ball_prep is not None
+            and self._prev_ball_prep.shape == prep.shape
+        )
+        if run_farneback:
+            flow_cent = track_centroid_farneback_path_tube(
+                self._prev_ball_prep,
+                prep,
                 cx_b,
                 cy_b,
-                r_px,
-                lower,
-                upper,
-                prefer_manual=True,
-                anchor_ball_xy=eff_anchor,
-                anchor_weight=eff_anchor_w,
-                allow_auto_fallback=False,
-                tube_mask=tube_mask,
+                flow_roi,
             )
-            t_now = time.perf_counter()
-            cent: Optional[Tuple[float, float]] = cent_hsv
-            gray = cv2.cvtColor(ball_bgr, cv2.COLOR_BGR2GRAY)
-            prep = preprocess_ball_gray(gray)
-            flow_roi = annulus_path_tube_mask_ball_roi(bh, bw, cx_b, cy_b, r_px, tube_mask)
-            flow_cent: Optional[Tuple[float, float]] = None
-            if self._prev_ball_prep is not None and self._prev_ball_prep.shape == prep.shape:
-                flow_cent = track_centroid_farneback_path_tube(
-                    self._prev_ball_prep,
-                    prep,
-                    cx_b,
-                    cy_b,
-                    flow_roi,
-                )
-            self._prev_ball_prep = prep.copy()
+        self._prev_ball_prep = prep.copy()
 
-            if flow_cent is not None:
-                cent = flow_cent
-                self._trusted_ball_cent = flow_cent
-                self._extrap_frames_used = 0
-            elif (
-                self._extrap_frames_used < 3
-                and self._trusted_ball_cent is not None
-                and self._speed_tracker is not None
-                and abs(self._speed_tracker.last_signed_omega_rad_s) > 1e-5
-            ):
-                if self._last_track_time <= 0:
-                    dt = 1.0 / 30.0
-                else:
-                    dt = min(max(t_now - self._last_track_time, 1e-4), 0.25)
-                cent = extrapolate_ball_on_wheel_orbit(
-                    cx_b,
-                    cy_b,
-                    self._trusted_ball_cent[0],
-                    self._trusted_ball_cent[1],
-                    self._speed_tracker.last_signed_omega_rad_s,
-                    dt,
-                )
-                self._extrap_frames_used += 1
+        if flow_cent is not None:
+            cent = flow_cent
+            self._extrap_frames_used = 0
+        elif (
+            self._extrap_frames_used < 7
+            and self._trusted_ball_cent is not None
+            and self._speed_tracker is not None
+            and abs(self._speed_tracker.last_signed_omega_rad_s) > 1e-5
+        ):
+            if self._last_track_time <= 0:
+                dt = 1.0 / 30.0
             else:
-                cent = cent_hsv
-                self._extrap_frames_used = 0
-                if cent_hsv is not None:
-                    self._trusted_ball_cent = cent_hsv
-            self._last_track_time = t_now
+                dt = min(max(t_now - self._last_track_time, 1e-4), 0.25)
+            cent = extrapolate_ball_on_wheel_orbit(
+                cx_b,
+                cy_b,
+                self._trusted_ball_cent[0],
+                self._trusted_ball_cent[1],
+                self._speed_tracker.last_signed_omega_rad_s,
+                dt,
+            )
+            self._extrap_frames_used += 1
+        else:
+            cent = cent_hsv
+            self._extrap_frames_used = 0
+        self._last_track_time = t_now
 
-            if cent is not None:
-                self._last_ball_cent_roi = cent
-                ix = int(np.clip(round(cent[0]), 0, bw - 1))
-                iy = int(np.clip(round(cent[1]), 0, bh - 1))
-                mask_seed = cent
-                if int(bmask_track[iy, ix]) < 128 and cent_hsv is not None:
-                    mask_seed = cent_hsv
-                bmask_display = mask_keep_blob_at_tracked_centroid(bmask_track, mask_seed)
-            else:
-                bmask_display = np.zeros((bh, bw), dtype=np.uint8)
-            # Loose guard: ball orbits inside ~r; strict 1.02*r rejected valid rim positions when r was tight.
-            if cent is not None and r_px > 1e-3:
-                radial = math.hypot(cent[0] - cx_b, cent[1] - cy_b)
-                if radial > float(r_px) * 1.12:
-                    cent = None
-            omega_out = 0.0
-            if cent and self._speed_tracker:
-                omega = self._speed_tracker.update(time.perf_counter(), cent[0], cent[1])
-                if omega is not None:
-                    omega_out = float(omega)
-                    self.speed_text.emit(f"Ball speed (exp.): {omega:.2f} rad/s")
-                else:
-                    self.speed_text.emit("Ball speed (exp.): …")
-            else:
-                self.speed_text.emit("Ball speed (exp.): …")
-            self.ball_omega.emit(omega_out)
+        def _track_point_ok(c: Optional[Tuple[float, float]]) -> bool:
+            if c is None or r_px <= 1e-3:
+                return False
+            if not centroid_in_track_annulus(c[0], c[1], cx_b, cy_b, r_px):
+                return False
+            if track_geom_mask is not None:
+                if not centroid_near_step2_track_mask(
+                    c[0],
+                    c[1],
+                    track_geom_mask,
+                    radius_px=self._TRACK_MASK_NEAR_RADIUS_PX,
+                ):
+                    return False
+            return True
 
-        # Show white+green dot at tracked centroid, or at pick projection if mask has not locked yet.
-        cent_draw = cent
-        if ball_locked and cent_draw is None and anchor_ball_roi is not None:
-            cent_draw = anchor_ball_roi
+        # Flow can land slightly off the painted stroke or fail masks; fall back to HSV centroid.
+        if not _track_point_ok(cent):
+            cent = cent_hsv if _track_point_ok(cent_hsv) else None
+
+        if cent is not None:
+            self._trusted_ball_cent = cent
+            self._last_ball_cent_roi = cent
+            self._viz_cent_miss_streak = 0
+            self._ring_coast_frames_left = self._RING_COAST_FRAMES
+        else:
+            self._viz_cent_miss_streak += 1
+            if self._ring_coast_frames_left > 0:
+                self._ring_coast_frames_left -= 1
+        bmask_display = ball_path_hsv_preview_mask(
+            ball_bgr, cx_b, cy_b, r_px, lower, upper, tube_mask=tube_mask
+        )
+        if cent is not None:
+            bmask_display = mask_keep_blob_at_tracked_centroid(bmask_display, cent)
+        omega_out = 0.0
+        if cent and self._speed_tracker:
+            omega = self._speed_tracker.update(time.perf_counter(), cent[0], cent[1])
+            if omega is not None:
+                omega_out = float(omega)
+                self._emit_speed_overlay(f"Ball speed (exp.): {omega:.2f} rad/s")
+            else:
+                self._emit_speed_overlay("Ball speed (exp.): …")
+        else:
+            self._emit_speed_overlay("Ball speed (exp.): …")
+        self.ball_omega.emit(omega_out)
+
+        # Ring position: follow centroid; coast at last good position. Debounce green vs orange.
+        cent_draw: Optional[Tuple[float, float]] = None
+        ring_use_green = True
+        if cent is not None:
+            cent_draw = cent
+        elif self._trusted_ball_cent is not None and self._ring_coast_frames_left > 0:
+            cent_draw = self._trusted_ball_cent
+            ring_use_green = self._viz_cent_miss_streak < self._ORANGE_RING_AFTER_MISS_FRAMES
 
         sx = wheel_bgr.shape[1] / float(ww)
         sy = wheel_bgr.shape[0] / float(wh)
@@ -430,18 +497,10 @@ class VisionWorker(QThread):
             by = int((bt + cent_draw[1] - wt) * sy)
             if 0 <= bx < wheel_out.shape[1] and 0 <= by < wheel_out.shape[0]:
                 r_ball = max(8, min(18, wheel_out.shape[0] // 45))
-                fill = (220, 230, 255) if cent is None else (255, 255, 255)
-                edge = (0, 200, 255) if cent is None else (0, 255, 0)
-                cv2.circle(wheel_out, (bx, by), r_ball, fill, -1)
-                cv2.circle(wheel_out, (bx, by), r_ball, edge, 2)
+                edge = (0, 255, 0) if ring_use_green else (0, 200, 255)
+                cv2.circle(wheel_out, (bx, by), r_ball, edge, 3)
                 cv2.circle(mask_wheel, (bx, by), 16, edge, 2)
-        if self._pick_highlight_xy is not None:
-            hx, hy = self._pick_highlight_xy
-            if 0 <= hx < wheel_out.shape[1] and 0 <= hy < wheel_out.shape[0]:
-                cv2.circle(wheel_out, (hx, hy), 12, (0, 255, 255), 2)
-                cv2.circle(mask_wheel, (hx, hy), 12, (0, 255, 255), 2)
 
-        # Color Detection: tuning mask before pick; after pick, locked HSV with only the tracked blob.
         ball_vis = cv2.cvtColor(bmask_display, cv2.COLOR_GRAY2BGR)
         color_h = wheel_out.shape[0]
         color_w = max(1, int(bw * color_h / max(1, bh)))
@@ -449,23 +508,11 @@ class VisionWorker(QThread):
         if cent_draw is not None and bw > 0 and bh > 0:
             cx = int(cent_draw[0] * color_w / bw)
             cy = int(cent_draw[1] * color_h / bh)
-            ccol = (0, 200, 255) if cent is None else (0, 255, 0)
+            ccol = (0, 255, 0) if ring_use_green else (0, 200, 255)
             cv2.circle(color_out, (cx, cy), max(8, min(20, color_h // 12)), ccol, 2)
-        if self._pick_highlight_xy is not None:
-            hx, hy = self._pick_highlight_xy
-            mapped = _wheel_preview_xy_to_ball_roi_xy(
-                hx, hy, wheel_out.shape[1], wheel_out.shape[0], ww, wh, wl, wt, bl, bt, bw, bh
-            )
-            if mapped is not None:
-                px = int(mapped[0] * color_w / bw)
-                py = int(mapped[1] * color_h / bh)
-                cv2.circle(color_out, (px, py), max(6, min(16, color_h // 14)), (0, 255, 255), 2)
 
-        now = time.perf_counter()
-        if now - self._last_wheel_emit_t >= 1.0 / 30.0:
-            self._last_wheel_emit_t = now
-            self.frame_color.emit(_bgr_to_qimage(color_out))
-            self.frame_wheel.emit(_bgr_to_qimage(wheel_out))
+        self.frame_color.emit(_bgr_to_qimage(color_out))
+        self.frame_wheel.emit(_bgr_to_qimage(wheel_out))
 
 
 class OcrSpinWorker(QThread):

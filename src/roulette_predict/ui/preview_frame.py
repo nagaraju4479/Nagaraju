@@ -51,9 +51,9 @@ class RoulettePreviewFrame(QWidget):
         self._speed.raise_()
         self._speed.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
 
-    def set_ball_pick_cursor(self, _enabled: bool) -> None:
-        """Normal arrow cursor only (pick mode uses the same as the rest of the UI)."""
-        cur = Qt.CursorShape.ArrowCursor
+    def set_ball_pick_cursor(self, enabled: bool) -> None:
+        """Crosshair while waiting for a live pick on the Roulette preview; arrow otherwise."""
+        cur = Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
         self.setCursor(cur)
         self._image.setCursor(cur)
 
@@ -79,7 +79,7 @@ class RoulettePreviewFrame(QWidget):
         pm = QPixmap.fromImage(self._last_image).scaled(
             self._image.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         )
         x = max(0, (self._image.width() - pm.width()) // 2)
         y = max(0, (self._image.height() - pm.height()) // 2)

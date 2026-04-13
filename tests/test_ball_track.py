@@ -7,6 +7,52 @@ import numpy as np
 from roulette_predict.config_model import CalibrationData
 
 
+def test_centroid_in_track_annulus_rejects_hub() -> None:
+    from roulette_predict.vision.ball_track import centroid_in_track_annulus
+
+    cx, cy, r = 100.0, 100.0, 80.0
+    assert not centroid_in_track_annulus(cx + 5, cy, cx, cy, r)
+    assert centroid_in_track_annulus(cx + 0.65 * r, cy, cx, cy, r)
+
+
+def test_centroid_on_step2_track_mask_requires_white_pixel() -> None:
+    from roulette_predict.vision.ball_track import centroid_on_step2_track_mask
+
+    m = np.zeros((40, 40), dtype=np.uint8)
+    m[10:30, 10:30] = 255
+    assert centroid_on_step2_track_mask(15.0, 15.0, m)
+    assert not centroid_on_step2_track_mask(5.0, 5.0, m)
+
+
+def test_find_moving_ball_requires_frame_change() -> None:
+    """Identical frames → no motion mask → None (caller falls back to white-blob pick)."""
+    from roulette_predict.config_model import CalibrationData
+    from roulette_predict.vision.ball_track import (
+        find_moving_ball_centroid_near_click_for_pick,
+        path_tube_mask_ball_roi,
+    )
+
+    h, w = 120, 180
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    cal = CalibrationData(ball_path_points=[[30.0, 30.0], [90.0, 90.0]])
+    tube = path_tube_mask_ball_roi(h, w, cal)
+    assert tube is not None
+    out = find_moving_ball_centroid_near_click_for_pick(
+        img, img, 60.0, 60.0, 55.0, 60.0, 60.0, tube
+    )
+    assert out is None
+
+
+def test_centroid_near_step2_track_mask_allows_small_offset() -> None:
+    from roulette_predict.vision.ball_track import centroid_near_step2_track_mask
+
+    m = np.zeros((40, 40), dtype=np.uint8)
+    m[20, 20] = 255
+    assert centroid_near_step2_track_mask(20.0, 20.0, m, radius_px=5)
+    assert centroid_near_step2_track_mask(23.0, 18.0, m, radius_px=5)
+    assert not centroid_near_step2_track_mask(5.0, 5.0, m, radius_px=2)
+
+
 def test_path_tube_mask_covers_painted_channel() -> None:
     from roulette_predict.vision.ball_track import path_tube_mask_ball_roi
 

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import copy
 import random
 import threading
 import time
 from typing import Optional
 
+import numpy as np
 from PySide6.QtCore import QCoreApplication, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
@@ -29,14 +29,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from roulette_predict.capture.worker import OcrSpinWorker, VisionWorker, ball_path_roi, wheel_roi
+from roulette_predict.capture.worker import (
+    OcrSpinWorker,
+    VisionWorker,
+    _wheel_preview_xy_to_ball_roi_xy,
+    ball_path_roi,
+    snapshot_ball_path_bgr_and_geometry,
+    wheel_roi,
+)
 from roulette_predict.config_model import CalibrationData, HsvSettings, normalize_tesseract_cmd
 from roulette_predict.persistence import load_config, save_config
 from roulette_predict.state import AppState, StateModel
-from roulette_predict.ui.ball_pick_overlay import BallPickScreenOverlay
 from roulette_predict.ui.calibration_overlay import CalibrationOverlay
 from roulette_predict.ui.preview_frame import RoulettePreviewFrame
 from roulette_predict.ui.theme import build_app_stylesheet
+from roulette_predict.vision.ball_track import (
+    centroid_near_step2_track_mask,
+    path_tube_mask_ball_roi,
+    track_region_mask_ball_roi,
+)
+from roulette_predict.vision.hsv_sample import hsv_settings_from_bgr_patch_median
 from roulette_predict.vision.ocr_spin import is_tesseract_available, read_roulette_number_from_roi
 
 
@@ -66,7 +78,6 @@ class MainWindow(QMainWindow):
         self._cal = CalibrationData()
         self._hsv = HsvSettings()
         self._overlay: Optional[CalibrationOverlay] = None
-        self._ball_pick_overlay: Optional[BallPickScreenOverlay] = None
         self._instruction_popup: Optional[QDialog] = None
         self._seed_history_attempt: int = 0
         self._history_numbers: list[int] = []
@@ -76,6 +87,11 @@ class MainWindow(QMainWindow):
         self._LOW_BALL_SPEED_RAD_S: float = 1.0
         self._shutdown_in_progress: bool = False
         self._shutdown_deadline: float = 0.0
+        # Coalesce cross-thread preview signals so we don't run N expensive rescales when the GUI thread lags.
+        self._latest_wheel_img: Optional[QImage] = None
+        self._wheel_paint_scheduled: bool = False
+        self._latest_color_img: Optional[QImage] = None
+        self._color_paint_scheduled: bool = False
 
         raw = load_config()
         from roulette_predict.persistence import parse_loaded
@@ -88,6 +104,9 @@ class MainWindow(QMainWindow):
         self._apply_opacity(opacity)
         self._apply_red_border(red_border)
         self._connect_sliders()
+        self._roulette_preview.image_clicked.connect(self._on_roulette_ball_sample_click)
+        self._ball_pick_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._ball_pick_esc.activated.connect(self._cancel_ball_sample_pick)
 
         self._worker = VisionWorker(self)
         self._ocr_worker = OcrSpinWorker(self)
@@ -119,145 +138,8 @@ class MainWindow(QMainWindow):
         self._event_pump.start(33)
         self._set_previews_blank()
 
-        esc_pick = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
-        esc_pick.setContext(Qt.ShortcutContext.WindowShortcut)
-        esc_pick.activated.connect(self._cancel_ball_pick)
-
-    def _cancel_ball_pick(self) -> None:
-        if self._ball_pick_btn.isChecked():
-            self._ball_pick_btn.setChecked(False)
-
     def _pump_cross_thread_events(self) -> None:
         QCoreApplication.sendPostedEvents()
-
-    def _open_ball_screen_pick_overlay(self) -> None:
-        screens = QGuiApplication.screens()
-        if not screens:
-            return
-        mid = int(self._cal.monitor_index) - 1
-        mid = max(0, min(mid, len(screens) - 1))
-        geo = screens[mid].geometry()
-        self._ball_pick_overlay = BallPickScreenOverlay(geo, self)
-        self._ball_pick_overlay.picked.connect(self._on_ball_pick_screen)
-        self._ball_pick_overlay.cancelled.connect(self._on_ball_pick_screen_cancel)
-        self._ball_pick_overlay.destroyed.connect(self._on_ball_pick_overlay_destroyed)
-        self.showMinimized()
-        self._ball_pick_overlay.showFullScreen()
-
-    def _on_ball_pick_overlay_destroyed(self) -> None:
-        self._ball_pick_overlay = None
-
-    def _on_ball_pick_screen_cancel(self) -> None:
-        self._ball_pick_btn.blockSignals(True)
-        self._ball_pick_btn.setChecked(False)
-        self._ball_pick_btn.blockSignals(False)
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-
-    def _on_ball_pick_screen(self, gx: int, gy: int) -> None:
-        import mss
-        import numpy as np
-
-        broi = ball_path_roi(self._cal)
-        if not broi:
-            QMessageBox.warning(
-                self,
-                "Ball pick",
-                "No Step-2 ball path in calibration. Complete Setup first.",
-            )
-            self._on_ball_pick_screen_cancel()
-            return
-        bl, bt, bw, bh = broi
-        if not (bl <= gx < bl + bw and bt <= gy < bt + bh):
-            QMessageBox.warning(
-                self,
-                "Ball pick",
-                "Click inside the Step-2 ball-path area on screen (the rectangle around your painted path).",
-            )
-            self._open_ball_screen_pick_overlay()
-            return
-        rad = 7
-        left = gx - rad
-        top = gy - rad
-        w = 2 * rad + 1
-        h = 2 * rad + 1
-        try:
-            with mss.mss() as sct:
-                shot = sct.grab({"left": left, "top": top, "width": w, "height": h})
-                arr = np.asarray(shot)[:, :, :3].copy()
-        except Exception:
-            QMessageBox.warning(
-                self,
-                "Ball pick",
-                "Could not read that screen region. Try again slightly away from the screen edge.",
-            )
-            self._open_ball_screen_pick_overlay()
-            return
-        self._apply_ball_color_lock_from_small_bgr_patch(arr)
-        self._set_ball_pick_highlight_for_screen_xy(gx, gy)
-        self._ball_pick_btn.blockSignals(True)
-        self._ball_pick_btn.setChecked(False)
-        self._ball_pick_btn.blockSignals(False)
-        self._ball_pick_overlay = None
-        self.showNormal()
-        self.raise_()
-        self.activateWindow()
-        self._capture_hint.setText(
-            "Ball color locked — tracker uses Step-2 path + motion on the spinning ball only. "
-            "White disk + green ring on Roulette Detection; Color tab = ball-path mask."
-        )
-
-    def _set_ball_pick_highlight_for_screen_xy(self, gx: int, gy: int) -> None:
-        wroi = wheel_roi(self._cal)
-        if not wroi:
-            self._worker.set_pick_highlight(None)
-            return
-        wl, wt, ww, wh = wroi
-        img = self._roulette_preview.last_image()
-        if img is None or img.isNull():
-            self._worker.set_pick_highlight(None)
-            return
-        pw, ph = img.width(), img.height()
-        u = (gx - wl) / max(1.0, float(ww))
-        v = (gy - wt) / max(1.0, float(wh))
-        hx = int(max(0, min(pw - 1, round(u * pw))))
-        hy = int(max(0, min(ph - 1, round(v * ph))))
-        self._worker.set_pick_highlight((hx, hy))
-
-    def _apply_ball_color_lock_from_small_bgr_patch(self, arr) -> None:
-        h, w = arr.shape[:2]
-        if h < 2 or w < 2:
-            return
-        us_before = self._sliders["U-S"].value()
-        self._sample_hsv_from_wheel_bgr_roi(arr, 0, 0, w, h, tight=True, for_ball_lock=True)
-        picked = copy.copy(self._hsv)
-        self._worker.set_ball_hsv_override(picked)
-        self._sliders["U-S"].blockSignals(True)
-        self._sliders["U-S"].setValue(us_before)
-        self._sliders["U-S"].blockSignals(False)
-        self._on_hsv_changed()
-
-    def _on_ball_pick_toggled(self, on: bool) -> None:
-        self._roulette_preview.set_ball_pick_cursor(False)
-        if on:
-            if not self._cal or len(self._cal.ball_path_points) < 2:
-                self._ball_pick_btn.blockSignals(True)
-                self._ball_pick_btn.setChecked(False)
-                self._ball_pick_btn.blockSignals(False)
-                self._capture_hint.setText("Complete **Step 2** (ball path on the wheel) in Setup first.")
-                return
-            self._capture_hint.setText(
-                "The window minimizes — click the ball on the **live** wheel inside your Step-2 path. **Esc** cancels."
-            )
-            self._open_ball_screen_pick_overlay()
-        else:
-            if self._ball_pick_overlay is not None:
-                self._ball_pick_overlay.close()
-                self._ball_pick_overlay = None
-            self.showNormal()
-            self.raise_()
-            self.activateWindow()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -372,20 +254,15 @@ class MainWindow(QMainWindow):
         hdr_color.setObjectName("sectionHeader")
         rl.addWidget(hdr_color)
         color_hint = QLabel(
-            "**1)** On Color tab, tune **U-S** / **L-V** — preview uses your **Step-2 painted path** as a narrow "
-            "tube so the whole golden ring does not turn white (only the channel you brushed). "
-            "**2)** **Pick white ball** (window minimizes) — click the spinning ball on the **live** game window, "
-            "inside your painted path. After pick, this tab shows **only** the picked color on **one** blob; "
-            "the green ring marks the tracked center."
+            "**Color / HSV:** The mask uses your **Step-2 tube path** plus sliders (**U-S**, **L-V**, **L-S**, etc.). "
+            "**Specular / lighting** can add white arcs or dots — raise **L-S** slightly to drop gray glints, tighten **U-S**, "
+            "or adjust **V** so only the ball + path stay white. If you darken until glints vanish, use **Pick ball color (click wheel)** "
+            "on **Roulette** to sample the ball and reopen a tight HSV cone. While tracking, the Color preview shows **one** blob (the target). "
+            "**Roulette** uses the same sliders; **flow** helps when glare competes with the ball. Run **Setup** to fix geometry."
         )
         color_hint.setObjectName("hintMuted")
         color_hint.setWordWrap(True)
         rl.addWidget(color_hint)
-
-        self._ball_pick_btn = QPushButton("Pick white ball (live wheel — fullscreen click)")
-        self._ball_pick_btn.setCheckable(True)
-        self._ball_pick_btn.toggled.connect(self._on_ball_pick_toggled)
-        rl.addWidget(self._ball_pick_btn)
 
         self._sliders = {}
         us_row = QHBoxLayout()
@@ -422,6 +299,15 @@ class MainWindow(QMainWindow):
         self._advanced_hsv_toggle.setChecked(False)
         self._advanced_hsv_toggle.toggled.connect(self._on_advanced_hsv_toggle)
         rl.addWidget(self._advanced_hsv_toggle)
+
+        self._ball_sample_btn = QPushButton("Pick ball color (click wheel)")
+        self._ball_sample_btn.setCheckable(True)
+        self._ball_sample_btn.setToolTip(
+            "Lower L-S / L-V until the mask clears, then click the ball on the painted track "
+            "(Step 2) on Roulette — HSV is set from that patch only."
+        )
+        self._ball_sample_btn.toggled.connect(self._on_ball_sample_pick_toggled)
+        rl.addWidget(self._ball_sample_btn)
 
         self._sliders["L-H"].setValue(self._hsv.l_h)
         self._sliders["U-H"].setValue(self._hsv.u_h)
@@ -502,17 +388,143 @@ class MainWindow(QMainWindow):
         self._worker.set_hsv(self._hsv)
         self._persist()
 
+    def _sync_sliders_from_hsv(self) -> None:
+        for s in self._sliders.values():
+            s.blockSignals(True)
+        try:
+            self._sliders["L-H"].setValue(self._hsv.l_h)
+            self._sliders["U-H"].setValue(self._hsv.u_h)
+            self._sliders["L-S"].setValue(self._hsv.l_s)
+            self._sliders["U-S"].setValue(self._hsv.u_s)
+            self._sliders["L-V"].setValue(self._hsv.l_v)
+            self._sliders["U-V"].setValue(self._hsv.u_v)
+        finally:
+            for s in self._sliders.values():
+                s.blockSignals(False)
+
+    def _cal_ready_for_ball_pick(self) -> bool:
+        return (
+            self._cal is not None
+            and self._cal.wheel_circle is not None
+            and len(self._cal.ball_path_points) >= 2
+        )
+
+    def _on_ball_sample_pick_toggled(self, on: bool) -> None:
+        if on:
+            if not self._cal_ready_for_ball_pick():
+                self._ball_sample_btn.blockSignals(True)
+                self._ball_sample_btn.setChecked(False)
+                self._ball_sample_btn.blockSignals(False)
+                self._capture_hint.setText("Complete **Setup** (wheel + ball path) first.")
+                return
+            if not self._roulette_preview.begin_pick_snapshot():
+                self._ball_sample_btn.blockSignals(True)
+                self._ball_sample_btn.setChecked(False)
+                self._ball_sample_btn.blockSignals(False)
+                self._capture_hint.setText("Wait for a **Roulette** preview frame, then try again.")
+                return
+            self._tabs.setCurrentIndex(0)
+            self._roulette_preview.set_ball_pick_cursor(True)
+            self._capture_hint.setText(
+                "**Roulette Detection** — lower **L-S** / **L-V** until the mask clears, then click **on the ball**. "
+                "**Esc** cancels."
+            )
+        else:
+            self._roulette_preview.set_ball_pick_cursor(False)
+
+    def _cancel_ball_sample_pick(self) -> None:
+        if not self._ball_sample_btn.isChecked():
+            return
+        self._ball_sample_btn.blockSignals(True)
+        self._ball_sample_btn.setChecked(False)
+        self._ball_sample_btn.blockSignals(False)
+        self._roulette_preview.set_ball_pick_cursor(False)
+        self._capture_hint.setText("Ball color pick cancelled.")
+
+    def _on_roulette_ball_sample_click(self, ix: int, iy: int) -> None:
+        if not self._ball_sample_btn.isChecked():
+            return
+        wroi = wheel_roi(self._cal)
+        broi = ball_path_roi(self._cal)
+        img = self._roulette_preview.last_image()
+        if not wroi or not broi or img is None or img.isNull():
+            self._capture_hint.setText("Need a live **Roulette** frame and calibration.")
+            return
+        wl, wt, ww, wh = wroi
+        bl, bt, bw, bh = broi
+        pw, ph = img.width(), img.height()
+        mapped = _wheel_preview_xy_to_ball_roi_xy(ix, iy, pw, ph, ww, wh, wl, wt, bl, bt, bw, bh)
+        if mapped is None:
+            self._capture_hint.setText("Click **on the wheel** where the ball is visible (inside the ball-path crop).")
+            return
+        snap = snapshot_ball_path_bgr_and_geometry(self._cal)
+        if snap is None:
+            self._capture_hint.setText("Could not grab ball-path frame.")
+            return
+        ball_bgr, _bl2, _bt2, bw2, bh2, cx_b, cy_b, r_px = snap
+        bx, by = mapped
+        tube = path_tube_mask_ball_roi(bh2, bw2, self._cal)
+        track_region = track_region_mask_ball_roi(bh2, bw2, cx_b, cy_b, r_px, tube)
+        if not centroid_near_step2_track_mask(bx, by, track_region, radius_px=8):
+            self._capture_hint.setText(
+                "Click **on the ball** on the **Step-2 track** (not the hub or wood outside the tube)."
+            )
+            return
+        bx_i = int(np.clip(round(bx), 0, max(0, bw2 - 1)))
+        by_i = int(np.clip(round(by), 0, max(0, bh2 - 1)))
+        r = 4
+        y0, y1 = max(0, by_i - r), min(bh2, by_i + r + 1)
+        x0, x1 = max(0, bx_i - r), min(bw2, bx_i + r + 1)
+        patch = ball_bgr[y0:y1, x0:x1]
+        if patch.size == 0:
+            self._capture_hint.setText("Ball patch is empty; try again.")
+            return
+        # Slightly tighter S/V margins than defaults so the new cone favors the ball over stray glints.
+        self._hsv = hsv_settings_from_bgr_patch_median(
+            patch, margin_h=12, margin_s=30, margin_v=26
+        )
+        self._sync_sliders_from_hsv()
+        self._worker.set_hsv(self._hsv)
+        self._persist()
+        self._ball_sample_btn.blockSignals(True)
+        self._ball_sample_btn.setChecked(False)
+        self._ball_sample_btn.blockSignals(False)
+        self._roulette_preview.set_ball_pick_cursor(False)
+        self._capture_hint.setText(
+            "HSV set from **ball** patch — check **Color** tab; tighten **U-S** / **L-V** if glints return."
+        )
+
     def _on_wheel_frame(self, img: QImage) -> None:
-        self._roulette_preview.set_frame_image(img)
+        self._latest_wheel_img = img
+        if self._wheel_paint_scheduled:
+            return
+        self._wheel_paint_scheduled = True
+        QTimer.singleShot(0, self._flush_wheel_frame_to_preview)
+
+    def _flush_wheel_frame_to_preview(self) -> None:
+        self._wheel_paint_scheduled = False
+        if self._latest_wheel_img is None or self._latest_wheel_img.isNull():
+            return
+        self._roulette_preview.set_frame_image(self._latest_wheel_img)
 
     def _on_color_frame(self, img: QImage) -> None:
         if img.isNull():
             return
+        self._latest_color_img = img
+        if self._color_paint_scheduled:
+            return
+        self._color_paint_scheduled = True
+        QTimer.singleShot(0, self._flush_color_frame_to_preview)
+
+    def _flush_color_frame_to_preview(self) -> None:
+        self._color_paint_scheduled = False
+        if self._latest_color_img is None or self._latest_color_img.isNull():
+            return
         self._color_preview.setText("")
-        self._color_preview.setPixmap(QPixmap.fromImage(img).scaled(
+        self._color_preview.setPixmap(QPixmap.fromImage(self._latest_color_img).scaled(
             self._color_preview.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
+            Qt.TransformationMode.FastTransformation,
         ))
 
     def _prepend_history(self, value: int) -> None:
@@ -582,7 +594,6 @@ class MainWindow(QMainWindow):
         # Spec: dim main window during wizard so the rotor is visible through the overlay.
         self._apply_opacity(0.3)
         self._worker.set_calibration(None)
-        self._worker.set_pick_highlight(None)
         self._ocr_worker.set_calibration(None)
         self._set_previews_blank()
         screen = QGuiApplication.primaryScreen()
@@ -604,12 +615,6 @@ class MainWindow(QMainWindow):
             cal.screen_scale = float(screen.devicePixelRatio())
         self._cal = cal
         self._worker.set_calibration(self._cal)
-        self._worker.set_pick_highlight(None)
-        self._ball_pick_btn.blockSignals(True)
-        self._ball_pick_btn.setChecked(False)
-        self._ball_pick_btn.blockSignals(False)
-        self._roulette_preview.set_ball_pick_cursor(False)
-        self._roulette_preview.end_pick_snapshot()
         self._ocr_worker.set_calibration(self._cal)
         self._ocr_worker.reset_spin_debounce()
         self._state.complete_calibration_from_overlay()
@@ -772,15 +777,14 @@ class MainWindow(QMainWindow):
         """Defaults tuned so the track-ring mask is not one huge blob (L-V rejects dark felt/ink)."""
         self._sliders["L-H"].setValue(0)
         self._sliders["U-H"].setValue(179)
-        self._sliders["L-S"].setValue(0)
+        self._sliders["L-S"].setValue(22)
         self._sliders["U-S"].setValue(200)
         self._sliders["L-V"].setValue(130)
         self._sliders["U-V"].setValue(255)
         self._capture_hint.setText(
-            "Open **Color** tab: lower **U-S** so only the ball path shows white (mask the track, not the whole ring). "
-            "If numbers still appear, use **Show all HSV** and tighten **L-V** / **U-V**. "
-            "Then **Pick white ball** — the window minimizes; click the ball on the **live** wheel inside your path. "
-            "White disk + green ring on Roulette Detection."
+            "Open **Color** tab: lower **U-S** so the tube path (and ideally the ball) show in the mask — not the whole ring. "
+            "Use **Show all HSV** to widen **H** / **L-V** / **U-V** if the ball is white but vanishes from the mask. "
+            "**Roulette** uses the same HSV live; green ring = tracked ball. **Flow** helps when color alone is ambiguous."
         )
 
     def _on_topmost(self, on: bool) -> None:
@@ -821,9 +825,6 @@ class MainWindow(QMainWindow):
     def _begin_graceful_shutdown(self) -> None:
         """Stop workers without blocking the GUI thread (fixes unresponsive title-bar close)."""
         self._close_setup_instruction()
-        if self._ball_pick_overlay is not None:
-            self._ball_pick_overlay.close()
-            self._ball_pick_overlay = None
         if self._overlay is not None:
             self._overlay.close()
             self._overlay = None

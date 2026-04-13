@@ -46,6 +46,50 @@ python -m roulette_predict
 pytest tests/ -v
 ```
 
+## Recent development (changelog for maintainers)
+
+This section summarizes **implementation choices and behavior** added or changed so future work (or AI sessions) can pick up context quickly.
+
+### HSV tuning vs ball visibility (no separate “pick ball” step)
+
+- **Single source of truth:** `VisionWorker` uses the **Color tab HSV sliders** (`set_hsv`) for both the mask preview and ball tracking. There is **no** “Pick white ball” lock or second HSV range.
+- **Why the ball might look “gone” in the mask:** HSV thresholds pixels by **hue / saturation / value**. If you tune so the **felt/background** is black and the **path** is white, a **white ball** often shares similar **V** (brightness) to the path — it should still appear **in-range** if **H** and **S** bands include the ball. If the ball disappears, **widen** `L-H`–`U-H` or raise **L-V** / **U-V** so the ball’s pixels stay inside the cone.
+- **When color is ambiguous:** The tracker also uses **dense optical flow** (Farneback) on the ball-path ROI, so **motion** on the tube can still localize the ball even when static HSV would confuse ball vs wood.
+- **Design tradeoff:** A pure “grayscale / white path only” mask is not a separate mode — the pipeline is **HSV + flow + tube geometry**, not ML segmentation.
+
+### Roulette tab preview quality / FPS
+
+- Wheel preview is **downscaled** to `WHEEL_PREVIEW_MAX_W` (currently **1280** px width) before display and wheel HSV mask; the **ball-path crop** used for tracking stays **full resolution** from the screen grab.
+- `RoulettePreviewFrame.rescale_frame()` uses **`FastTransformation`** (cheaper scaling than smooth) for snappier UI updates.
+- Tracking runs **HSV centroid + optical flow + masks + speed** every frame when calibration is complete; effective FPS is limited by **single-thread** `_process_frame` cost.
+
+### Tracker pipeline tuning (`VisionWorker`)
+
+- **Farneback:** `vision/ball_flow.py` uses tuned `FARNEBACK_PYR_LEVELS` / `FARNEBACK_WINSIZE` (lighter than OpenCV defaults) for CPU budget.
+- **Flow decimation:** dense flow runs every **`_FLOW_DECIMATE_STRIDE`** frames (2); other frames rely on HSV + orbit extrapolation when applicable.
+- **Geometry:** `centroid_near_step2_track_mask` uses **`_TRACK_MASK_NEAR_RADIUS_PX`** (8) so centroids slightly off the painted stroke are not dropped as often.
+- **Extrapolation:** when flow is weak, orbit extrapolation can run for up to **7** consecutive frames (see `_extrap_frames_used` cap in worker).
+
+### GUI: fewer dropped-looking updates
+
+- `main_window.py` **coalesces** `frame_wheel` / `frame_color` handling: latest image is stored and applied with `QTimer.singleShot(0, …)` so the UI thread does not run **many expensive rescales** when the worker queues ahead of paint.
+
+### Overlay rings (flicker reduction)
+
+- **Green** ring: **current track** when the centroid is trusted.
+- **Orange**: coasting / uncertain — after several consecutive missed centroids, while still showing the ring at the **last good** position.
+- **Coasting:** when `cent` is lost, the ring stays at **`_trusted_ball_cent`** for **`_RING_COAST_FRAMES`** (~32) frames before disappearing.
+- **Color hysteresis:** green vs orange shifts after **`_ORANGE_RING_AFTER_MISS_FRAMES`** (6) consecutive misses.
+- **Speed line:** `speed_text` uses **`_emit_speed_overlay`** (deduplicated emits).
+
+### Tests
+
+- `tests/test_ball_roi_map.py` — forward/inverse mapping between wheel preview pixels and ball-path ROI (`_wheel_preview_xy_to_ball_roi_xy` / `ball_roi_xy_to_wheel_preview_xy`).
+
+### Not in scope (documented for clarity)
+
+- **YOLO / detectors:** the stack remains classical CV + optional ML discussion; adding a small detector on the ball ROI would be a separate feature (dataset, ONNX/PyTorch, fusion with existing masks).
+
 ## Manual test checklist (multi-monitor / DPI)
 
 See `tests/MANUAL_CHECKLIST.md`.

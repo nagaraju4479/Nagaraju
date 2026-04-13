@@ -38,7 +38,7 @@ class BallPickScreenOverlay(QWidget):
         painter.drawText(
             24,
             36,
-            "Click the ball on the LIVE wheel (inside your Step-2 path).  Esc = cancel.",
+            "Click near the spinning ball on the tube — we lock onto **motion** (two frames).  Esc = cancel.",
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
