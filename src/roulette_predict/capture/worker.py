@@ -261,6 +261,8 @@ class VisionWorker(QThread):
         self._wheel_center_in_roi: Optional[Tuple[float, float]] = None
         # Last good ball centroid in ball-path ROI — continuity vs static rim highlights (ball ROI px).
         self._last_ball_cent_roi: Optional[Tuple[float, float]] = None
+        # Previous ball-path BGR frame for motion detection (frame differencing).
+        self._prev_ball_bgr: Optional[np.ndarray] = None
         # Preprocessed (blurred) grayscale for consecutive Farneback frames.
         self._prev_ball_prep: Optional[np.ndarray] = None
         # Last trusted (flow or HSV) centroid for ω extrapolation when flow mass is weak (not extrapolated).
@@ -282,6 +284,7 @@ class VisionWorker(QThread):
         self._speed_tracker = None
         self._wheel_center_in_roi = None
         self._last_ball_cent_roi = None
+        self._prev_ball_bgr = None
         self._prev_ball_prep = None
         self._trusted_ball_cent = None
         self._extrap_frames_used = 0
@@ -374,16 +377,18 @@ class VisionWorker(QThread):
             eff_anchor = self._last_ball_cent_roi
             eff_anchor_w = 0.82
 
-        # Fixed-HSV white-ball detector — no slider dependency; ring mask + morphology + circularity.
-        cent_hsv, mask_dbg, roi_dbg, det_dbg = detect_white_ball(
+        # Fixed-HSV + motion: only the moving bright ball passes, static diamonds/reflections drop.
+        cent_hsv, color_dbg, motion_dbg, final_dbg, det_dbg = detect_white_ball(
             ball_bgr,
             cx_b,
             cy_b,
             r_px,
             tube_mask=tube_mask,
+            prev_bgr=self._prev_ball_bgr,
             anchor_xy=eff_anchor,
             anchor_weight=eff_anchor_w,
         )
+        self._prev_ball_bgr = ball_bgr.copy()
         t_now = time.perf_counter()
         cent: Optional[Tuple[float, float]] = cent_hsv
         gray = cv2.cvtColor(ball_bgr, cv2.COLOR_BGR2GRAY)
@@ -493,15 +498,17 @@ class VisionWorker(QThread):
                 edge = (0, 255, 0) if ring_use_green else (0, 200, 255)
                 cv2.circle(wheel_out, (bx, by), r_ball, edge, 3)
 
-        # Color Detection tab: mask (left) | ROI (right) side-by-side debug composite.
-        target_h = wheel_out.shape[0]
-        mask_h, mask_w = mask_dbg.shape[:2]
-        roi_h, roi_w = roi_dbg.shape[:2]
-        mw = max(1, int(mask_w * target_h / max(1, mask_h)))
-        rw = max(1, int(roi_w * target_h / max(1, roi_h)))
-        m_resized = cv2.resize(mask_dbg, (mw, target_h), interpolation=cv2.INTER_NEAREST)
-        r_resized = cv2.resize(roi_dbg, (rw, target_h), interpolation=cv2.INTER_AREA)
-        color_out = np.hstack([m_resized, r_resized])
+        # Debug tab: 2×2 grid — color_mask | motion_mask / final_mask | detection
+        src_h, src_w = color_dbg.shape[:2]
+        cell_h = max(1, wheel_out.shape[0] // 2)
+        cell_w = max(1, int(src_w * cell_h / max(1, src_h)))
+
+        def _resize_cell(img: np.ndarray) -> np.ndarray:
+            return cv2.resize(img, (cell_w, cell_h), interpolation=cv2.INTER_NEAREST)
+
+        top_row = np.hstack([_resize_cell(color_dbg), _resize_cell(motion_dbg)])
+        bot_row = np.hstack([_resize_cell(final_dbg), _resize_cell(det_dbg)])
+        color_out = np.vstack([top_row, bot_row])
 
         self.frame_color.emit(_bgr_to_qimage(color_out))
         self.frame_wheel.emit(_bgr_to_qimage(wheel_out))

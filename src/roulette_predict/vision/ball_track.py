@@ -550,9 +550,11 @@ def detect_white_ball(
     wheel_r_px: float,
     tube_mask: Optional[np.ndarray] = None,
     *,
+    prev_bgr: Optional[np.ndarray] = None,
     hsv_lower: tuple = WHITE_BALL_HSV_LOWER,
     hsv_upper: tuple = WHITE_BALL_HSV_UPPER,
     blur_ksize: int = 5,
+    motion_thresh: int = 25,
     min_area: int = 10,
     max_area: int = 600,
     min_circularity: float = 0.7,
@@ -563,50 +565,71 @@ def detect_white_ball(
     np.ndarray,
     np.ndarray,
     np.ndarray,
+    np.ndarray,
 ]:
-    """Detect the roulette ball with a **fixed** HSV range tuned for a bright white/ivory ball.
+    """Detect the roulette ball by combining **color** and **motion** masks.
+
+    Static bright objects (diamonds, reflections) pass HSV but are not moving.
+    Only the ball is both bright-white AND moving frame-to-frame.
 
     Pipeline:
       1. Gaussian blur → reduce lighting noise
-      2. HSV inRange with fixed white-ball cone
-      3. Ring mask (annulus ∩ optional Step-2 tube ∩ Step-1 disk) → outer track only
-      4. Morphological open (remove speckle) + close (fill gaps)
-      5. Contour detection → filter by area + ``4π·area / perimeter²`` circularity
-      6. Pick the most circular, ball-sized contour (with optional anchor bias)
+      2. HSV inRange with fixed white-ball cone → ``color_mask``
+      3. Frame differencing (``|curr − prev|``) → threshold → ``motion_mask``
+      4. ``final_mask = color_mask & motion_mask`` (only moving bright pixels survive)
+      5. Ring mask (annulus ∩ tube ∩ disk) → outer track only
+      6. Morphological open + close
+      7. Contour detection → area + circularity filter → pick best
 
-    Returns ``(centroid_or_None, mask_debug_bgr, roi_debug_bgr, detection_debug_bgr)``.
-    All debug images are the same size as ``bgr``.
+    If ``prev_bgr`` is None (first frame), falls back to color-only detection.
+
+    Returns ``(centroid, color_mask_dbg, motion_mask_dbg, final_mask_dbg, detection_dbg)``.
     """
     import cv2
 
     if bgr.size == 0:
         empty = np.zeros((1, 1, 3), dtype=np.uint8)
-        return None, empty, empty, empty
+        return None, empty, empty, empty, empty
 
     h, w = bgr.shape[:2]
 
     # 1. Gaussian blur
     blurred = cv2.GaussianBlur(bgr, (blur_ksize, blur_ksize), 0)
 
-    # 2. HSV inRange — fixed white ball cone
+    # 2. HSV inRange — color mask for white ball
     hsv_img = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(
+    color_mask = cv2.inRange(
         hsv_img,
         np.array(hsv_lower, dtype=np.uint8),
         np.array(hsv_upper, dtype=np.uint8),
     )
 
-    # 3. Ring mask — outer track only (excludes centre pockets / hub)
+    # 3. Motion mask via frame differencing
+    if prev_bgr is not None and prev_bgr.shape == bgr.shape:
+        prev_blur = cv2.GaussianBlur(prev_bgr, (blur_ksize, blur_ksize), 0)
+        gray_curr = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        gray_prev = cv2.cvtColor(prev_blur, cv2.COLOR_BGR2GRAY)
+        diff = cv2.absdiff(gray_curr, gray_prev)
+        _, motion_mask = cv2.threshold(diff, motion_thresh, 255, cv2.THRESH_BINARY)
+        morph_sm = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        motion_mask = cv2.dilate(motion_mask, morph_sm, iterations=2)
+    else:
+        motion_mask = np.full((h, w), 255, dtype=np.uint8)
+
+    # 4. Combine: only pixels that are BOTH bright-white AND moving
+    final_mask = cv2.bitwise_and(color_mask, motion_mask)
+
+    # 5. Ring mask — outer track only
     ring = _region_annulus_tube_disk(h, w, wheel_cx, wheel_cy, wheel_r_px, tube_mask)
-    mask = cv2.bitwise_and(mask, ring)
+    final_mask = cv2.bitwise_and(final_mask, ring)
 
-    # 4. Morphological operations
+    # 6. Morphological cleanup
     morph_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, morph_k)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, morph_k)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_OPEN, morph_k)
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, morph_k)
 
-    # 5–6. Contour detection with area + circularity + optional anchor
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 7. Contour detection with area + circularity + anchor
+    contours, _ = cv2.findContours(final_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     diag = float(np.hypot(w, h))
     best_cent: Optional[Tuple[float, float]] = None
     best_r: float = 0.0
@@ -638,24 +661,29 @@ def detect_white_ball(
             best_r = float(r_enc)
 
     # ── Debug images ──
-    # Mask debug: white=in-range on black
-    mask_debug = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    # Color mask (HSV hits in ring, before motion gating)
+    color_ring = cv2.bitwise_and(color_mask, ring)
+    color_dbg = cv2.cvtColor(color_ring, cv2.COLOR_GRAY2BGR)
 
-    # ROI debug: dim everything outside the ring; bright inside
-    roi_debug = bgr.copy()
+    # Motion mask
+    motion_ring = cv2.bitwise_and(motion_mask, ring)
+    motion_dbg = cv2.cvtColor(motion_ring, cv2.COLOR_GRAY2BGR)
+
+    # Final combined mask (what contours are found on)
+    final_dbg = cv2.cvtColor(final_mask, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(final_dbg, contours, -1, (0, 255, 255), 1)
+
+    # Detection: original + green circle around ball only
+    det_dbg = bgr.copy()
     outside = ring == 0
-    roi_debug[outside] = (roi_debug[outside].astype(np.float32) * 0.25).astype(np.uint8)
-    cv2.drawContours(roi_debug, contours, -1, (0, 255, 255), 1)
-
-    # Detection debug: original image + green circle around ball only
-    det_debug = bgr.copy()
+    det_dbg[outside] = (det_dbg[outside].astype(np.float32) * 0.25).astype(np.uint8)
     if best_cent is not None:
         cx_i, cy_i = int(round(best_cent[0])), int(round(best_cent[1]))
         r_i = max(4, int(round(best_r)) + 4)
-        cv2.circle(det_debug, (cx_i, cy_i), r_i, (0, 255, 0), 2)
-        cv2.circle(det_debug, (cx_i, cy_i), 2, (0, 0, 255), -1)
+        cv2.circle(det_dbg, (cx_i, cy_i), r_i, (0, 255, 0), 2)
+        cv2.circle(det_dbg, (cx_i, cy_i), 2, (0, 0, 255), -1)
 
-    return best_cent, mask_debug, roi_debug, det_debug
+    return best_cent, color_dbg, motion_dbg, final_dbg, det_dbg
 
 
 def find_white_ball_centroid_near_click_for_pick(

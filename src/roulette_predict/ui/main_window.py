@@ -146,9 +146,9 @@ class MainWindow(QMainWindow):
         self._color_preview.setMinimumSize(10, 10)
         self._color_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._color_preview.setStyleSheet("background-color: #000000; color: #888888; border: none;")
-        self._color_preview.setText("Mask + ROI debug — waiting for capture")
+        self._color_preview.setText("Debug — waiting for capture")
         self._tabs.addTab(self._roulette_preview, "Roulette Detection")
-        self._tabs.addTab(self._color_preview, "Mask / ROI Debug")
+        self._tabs.addTab(self._color_preview, "Debug Masks")
         left_l.addWidget(self._tabs)
 
         right_inner = QWidget()
@@ -236,17 +236,16 @@ class MainWindow(QMainWindow):
         hf_l.addWidget(hist_scroll)
         rl.addWidget(history_frame)
 
-        hdr_color = QLabel("BALL DETECTION — fixed white-ball HSV")
+        hdr_color = QLabel("BALL DETECTION — HSV + motion")
         hdr_color.setObjectName("sectionHeader")
         rl.addWidget(hdr_color)
         color_hint = QLabel(
-            "**Ball detection** now uses a **fixed HSV range** (H 0–180, S 0–50, V 210–255) tuned for a bright white/ivory ball "
-            "under strong lighting. Detection is restricted to the **outer circular track** (Step-1 wheel ∩ Step-2 tube). "
-            "Morphological open + close removes specular noise; only **small, circular** contours pass "
-            "(circularity > 0.7 via 4π·area/perimeter²). Reflections are larger or irregular and get rejected. "
-            "**Mask/ROI Debug** tab shows the binary mask (left) and the ring ROI with contour outlines (right). "
-            "**Roulette Detection** shows a green circle on the detected ball only. "
-            "HSV sliders below are for **reference tuning** only — they do not affect ball detection."
+            "Ball detection combines **fixed HSV** (H 0–180, S 0–50, V 210–255) with **motion detection** "
+            "(frame differencing). Static bright objects (diamonds, reflections) are ignored — only the **moving** ball passes. "
+            "Detection is restricted to the **outer track** (Step-1 ∩ Step-2). "
+            "**Debug Masks** tab shows a 2×2 grid: color mask | motion mask | combined mask | detection. "
+            "**Roulette Detection** shows a green circle on the detected moving ball only. "
+            "HSV sliders below are for **reference** only — they do not affect detection."
         )
         color_hint.setObjectName("hintMuted")
         color_hint.setWordWrap(True)
@@ -657,10 +656,9 @@ class MainWindow(QMainWindow):
         self._sliders["L-V"].setValue(210)
         self._sliders["U-V"].setValue(255)
         self._capture_hint.setText(
-            "Ball detection uses a **fixed HSV range** for white ball (no slider dependency). "
-            "Check **Roulette Detection** for the green circle on the ball. "
-            "**Mask/ROI Debug** shows the binary mask + ring ROI. "
-            "Sliders are for reference only and do **not** affect detection."
+            "Ball detection uses **HSV + motion** — static diamonds/reflections are ignored. "
+            "Check **Roulette Detection** for the green circle on the moving ball. "
+            "**Debug Masks** shows color | motion | combined | detection in a 2×2 grid."
         )
 
     def _on_opacity_slider(self, v: int) -> None:
