@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 from PySide6.QtCore import QCoreApplication, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QGuiApplication, QImage, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -32,10 +32,6 @@ from PySide6.QtWidgets import (
 from roulette_predict.capture.worker import (
     OcrSpinWorker,
     VisionWorker,
-    _wheel_preview_xy_to_ball_roi_xy,
-    ball_path_roi,
-    snapshot_ball_path_bgr_and_geometry,
-    wheel_roi,
 )
 from roulette_predict.config_model import CalibrationData, HsvSettings, normalize_tesseract_cmd
 from roulette_predict.persistence import load_config, save_config
@@ -43,12 +39,6 @@ from roulette_predict.state import AppState, StateModel
 from roulette_predict.ui.calibration_overlay import CalibrationOverlay
 from roulette_predict.ui.preview_frame import RoulettePreviewFrame
 from roulette_predict.ui.theme import build_app_stylesheet
-from roulette_predict.vision.ball_track import (
-    centroid_near_step2_track_mask,
-    path_tube_mask_ball_roi,
-    track_region_mask_ball_roi,
-)
-from roulette_predict.vision.hsv_sample import hsv_settings_from_bgr_patch_median
 from roulette_predict.vision.ocr_spin import is_tesseract_available, read_roulette_number_from_roi
 
 
@@ -96,17 +86,13 @@ class MainWindow(QMainWindow):
         raw = load_config()
         from roulette_predict.persistence import parse_loaded
 
-        self._cal, self._hsv, red_border, opacity, self._tesseract_cmd = parse_loaded(raw)
+        self._cal, self._hsv, _red_border, opacity, self._tesseract_cmd = parse_loaded(raw)
         self._build_ui()
         self._seed_ocr_done.connect(self._on_seed_ocr_done)
-        self._red_border_check.setChecked(red_border)
         self._opacity_slider.setValue(int(opacity * 100))
         self._apply_opacity(opacity)
-        self._apply_red_border(red_border)
+        self.setStyleSheet(build_app_stylesheet(red_border=False))
         self._connect_sliders()
-        self._roulette_preview.image_clicked.connect(self._on_roulette_ball_sample_click)
-        self._ball_pick_esc = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
-        self._ball_pick_esc.activated.connect(self._cancel_ball_sample_pick)
 
         self._worker = VisionWorker(self)
         self._ocr_worker = OcrSpinWorker(self)
@@ -302,33 +288,12 @@ class MainWindow(QMainWindow):
         self._advanced_hsv_toggle.toggled.connect(self._on_advanced_hsv_toggle)
         rl.addWidget(self._advanced_hsv_toggle)
 
-        self._ball_sample_btn = QPushButton("Pick ball color (click wheel)")
-        self._ball_sample_btn.setCheckable(True)
-        self._ball_sample_btn.setToolTip(
-            "Lower L-S / L-V until the mask clears, then click the ball on the painted track "
-            "(Step 2) on Roulette — HSV is set from that patch only."
-        )
-        self._ball_sample_btn.toggled.connect(self._on_ball_sample_pick_toggled)
-        rl.addWidget(self._ball_sample_btn)
-
         self._sliders["L-H"].setValue(self._hsv.l_h)
         self._sliders["U-H"].setValue(self._hsv.u_h)
         self._sliders["L-S"].setValue(self._hsv.l_s)
         self._sliders["U-S"].setValue(self._hsv.u_s)
         self._sliders["L-V"].setValue(self._hsv.l_v)
         self._sliders["U-V"].setValue(self._hsv.u_v)
-
-        opts = QHBoxLayout()
-        self._topmost_check = QCheckBox("Always on top")
-        self._topmost_check.setChecked(True)
-        self._topmost_check.toggled.connect(self._on_topmost)
-        opts.addWidget(self._topmost_check)
-
-        self._red_border_check = QCheckBox("Red border (highlight)")
-        self._red_border_check.toggled.connect(self._apply_red_border)
-        opts.addWidget(self._red_border_check)
-
-        rl.addLayout(opts)
 
         op_row = QHBoxLayout()
         op_row.addWidget(QLabel("Opacity %"))
@@ -403,98 +368,6 @@ class MainWindow(QMainWindow):
         finally:
             for s in self._sliders.values():
                 s.blockSignals(False)
-
-    def _cal_ready_for_ball_pick(self) -> bool:
-        return (
-            self._cal is not None
-            and self._cal.wheel_circle is not None
-            and len(self._cal.ball_path_points) >= 2
-        )
-
-    def _on_ball_sample_pick_toggled(self, on: bool) -> None:
-        if on:
-            if not self._cal_ready_for_ball_pick():
-                self._ball_sample_btn.blockSignals(True)
-                self._ball_sample_btn.setChecked(False)
-                self._ball_sample_btn.blockSignals(False)
-                self._capture_hint.setText("Complete **Setup** (wheel + ball path) first.")
-                return
-            if not self._roulette_preview.begin_pick_snapshot():
-                self._ball_sample_btn.blockSignals(True)
-                self._ball_sample_btn.setChecked(False)
-                self._ball_sample_btn.blockSignals(False)
-                self._capture_hint.setText("Wait for a **Roulette** preview frame, then try again.")
-                return
-            self._tabs.setCurrentIndex(0)
-            self._roulette_preview.set_ball_pick_cursor(True)
-            self._capture_hint.setText(
-                "**Roulette Detection** — lower **L-S** / **L-V** until the mask clears, then click **on the ball**. "
-                "**Esc** cancels."
-            )
-        else:
-            self._roulette_preview.set_ball_pick_cursor(False)
-
-    def _cancel_ball_sample_pick(self) -> None:
-        if not self._ball_sample_btn.isChecked():
-            return
-        self._ball_sample_btn.blockSignals(True)
-        self._ball_sample_btn.setChecked(False)
-        self._ball_sample_btn.blockSignals(False)
-        self._roulette_preview.set_ball_pick_cursor(False)
-        self._capture_hint.setText("Ball color pick cancelled.")
-
-    def _on_roulette_ball_sample_click(self, ix: int, iy: int) -> None:
-        if not self._ball_sample_btn.isChecked():
-            return
-        wroi = wheel_roi(self._cal)
-        broi = ball_path_roi(self._cal)
-        img = self._roulette_preview.last_image()
-        if not wroi or not broi or img is None or img.isNull():
-            self._capture_hint.setText("Need a live **Roulette** frame and calibration.")
-            return
-        wl, wt, ww, wh = wroi
-        bl, bt, bw, bh = broi
-        pw, ph = img.width(), img.height()
-        mapped = _wheel_preview_xy_to_ball_roi_xy(ix, iy, pw, ph, ww, wh, wl, wt, bl, bt, bw, bh)
-        if mapped is None:
-            self._capture_hint.setText("Click **on the wheel** where the ball is visible (inside the ball-path crop).")
-            return
-        snap = snapshot_ball_path_bgr_and_geometry(self._cal)
-        if snap is None:
-            self._capture_hint.setText("Could not grab ball-path frame.")
-            return
-        ball_bgr, _bl2, _bt2, bw2, bh2, cx_b, cy_b, r_px = snap
-        bx, by = mapped
-        tube = path_tube_mask_ball_roi(bh2, bw2, self._cal)
-        track_region = track_region_mask_ball_roi(bh2, bw2, cx_b, cy_b, r_px, tube)
-        if not centroid_near_step2_track_mask(bx, by, track_region, radius_px=8):
-            self._capture_hint.setText(
-                "Click **on the ball** on the **Step-2 track** (not the hub or wood outside the tube)."
-            )
-            return
-        bx_i = int(np.clip(round(bx), 0, max(0, bw2 - 1)))
-        by_i = int(np.clip(round(by), 0, max(0, bh2 - 1)))
-        r = 4
-        y0, y1 = max(0, by_i - r), min(bh2, by_i + r + 1)
-        x0, x1 = max(0, bx_i - r), min(bw2, bx_i + r + 1)
-        patch = ball_bgr[y0:y1, x0:x1]
-        if patch.size == 0:
-            self._capture_hint.setText("Ball patch is empty; try again.")
-            return
-        # Slightly tighter S/V margins than defaults so the new cone favors the ball over stray glints.
-        self._hsv = hsv_settings_from_bgr_patch_median(
-            patch, margin_h=12, margin_s=30, margin_v=26
-        )
-        self._sync_sliders_from_hsv()
-        self._worker.set_hsv(self._hsv)
-        self._persist()
-        self._ball_sample_btn.blockSignals(True)
-        self._ball_sample_btn.setChecked(False)
-        self._ball_sample_btn.blockSignals(False)
-        self._roulette_preview.set_ball_pick_cursor(False)
-        self._capture_hint.setText(
-            "HSV set from **ball** patch — check **Color** tab; tighten **U-S** / **L-V** if glints return."
-        )
 
     def _on_wheel_frame(self, img: QImage) -> None:
         self._latest_wheel_img = img
@@ -790,10 +663,6 @@ class MainWindow(QMainWindow):
             "Sliders are for reference only and do **not** affect detection."
         )
 
-    def _on_topmost(self, on: bool) -> None:
-        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, on)
-        self.show()
-
     def _on_opacity_slider(self, v: int) -> None:
         self._apply_opacity(v / 100.0)
         self._persist()
@@ -801,15 +670,11 @@ class MainWindow(QMainWindow):
     def _apply_opacity(self, a: float) -> None:
         self.setWindowOpacity(max(0.1, min(1.0, a)))
 
-    def _apply_red_border(self, on: bool) -> None:
-        self.setStyleSheet(build_app_stylesheet(red_border=on))
-        self._persist()
-
     def _persist(self) -> None:
         save_config(
             self._cal,
             self._hsv,
-            self._red_border_check.isChecked(),
+            False,
             self._opacity_slider.value() / 100.0,
             self._tesseract_cmd,
         )
