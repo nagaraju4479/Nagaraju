@@ -539,6 +539,125 @@ def ball_track_mask_and_centroid(
     return manual, cent_m, False
 
 
+WHITE_BALL_HSV_LOWER = (0, 0, 210)
+WHITE_BALL_HSV_UPPER = (180, 50, 255)
+
+
+def detect_white_ball(
+    bgr: np.ndarray,
+    wheel_cx: float,
+    wheel_cy: float,
+    wheel_r_px: float,
+    tube_mask: Optional[np.ndarray] = None,
+    *,
+    hsv_lower: tuple = WHITE_BALL_HSV_LOWER,
+    hsv_upper: tuple = WHITE_BALL_HSV_UPPER,
+    blur_ksize: int = 5,
+    min_area: int = 10,
+    max_area: int = 600,
+    min_circularity: float = 0.7,
+    anchor_xy: Optional[Tuple[float, float]] = None,
+    anchor_weight: float = 0.0,
+) -> Tuple[
+    Optional[Tuple[float, float]],
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Detect the roulette ball with a **fixed** HSV range tuned for a bright white/ivory ball.
+
+    Pipeline:
+      1. Gaussian blur → reduce lighting noise
+      2. HSV inRange with fixed white-ball cone
+      3. Ring mask (annulus ∩ optional Step-2 tube ∩ Step-1 disk) → outer track only
+      4. Morphological open (remove speckle) + close (fill gaps)
+      5. Contour detection → filter by area + ``4π·area / perimeter²`` circularity
+      6. Pick the most circular, ball-sized contour (with optional anchor bias)
+
+    Returns ``(centroid_or_None, mask_debug_bgr, roi_debug_bgr, detection_debug_bgr)``.
+    All debug images are the same size as ``bgr``.
+    """
+    import cv2
+
+    if bgr.size == 0:
+        empty = np.zeros((1, 1, 3), dtype=np.uint8)
+        return None, empty, empty, empty
+
+    h, w = bgr.shape[:2]
+
+    # 1. Gaussian blur
+    blurred = cv2.GaussianBlur(bgr, (blur_ksize, blur_ksize), 0)
+
+    # 2. HSV inRange — fixed white ball cone
+    hsv_img = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(
+        hsv_img,
+        np.array(hsv_lower, dtype=np.uint8),
+        np.array(hsv_upper, dtype=np.uint8),
+    )
+
+    # 3. Ring mask — outer track only (excludes centre pockets / hub)
+    ring = _region_annulus_tube_disk(h, w, wheel_cx, wheel_cy, wheel_r_px, tube_mask)
+    mask = cv2.bitwise_and(mask, ring)
+
+    # 4. Morphological operations
+    morph_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, morph_k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, morph_k)
+
+    # 5–6. Contour detection with area + circularity + optional anchor
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    diag = float(np.hypot(w, h))
+    best_cent: Optional[Tuple[float, float]] = None
+    best_r: float = 0.0
+    best_score: float = -1e18
+
+    for cnt in contours:
+        area = float(cv2.contourArea(cnt))
+        if area < min_area or area > max_area:
+            continue
+        perim = float(cv2.arcLength(cnt, True))
+        if perim < 1e-6:
+            continue
+        circ = 4.0 * math.pi * area / (perim * perim)
+        if circ < min_circularity:
+            continue
+        mom = cv2.moments(cnt)
+        if mom["m00"] < 1e-6:
+            continue
+        cx = float(mom["m10"] / mom["m00"])
+        cy = float(mom["m01"] / mom["m00"])
+        (_, _), r_enc = cv2.minEnclosingCircle(cnt)
+        score = circ
+        if anchor_xy is not None and anchor_weight > 0.0:
+            d = float(np.hypot(cx - anchor_xy[0], cy - anchor_xy[1])) / (diag + 1e-6)
+            score += anchor_weight * (1.0 - min(d * 4.0, 1.0))
+        if score > best_score:
+            best_score = score
+            best_cent = (cx, cy)
+            best_r = float(r_enc)
+
+    # ── Debug images ──
+    # Mask debug: white=in-range on black
+    mask_debug = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+
+    # ROI debug: dim everything outside the ring; bright inside
+    roi_debug = bgr.copy()
+    outside = ring == 0
+    roi_debug[outside] = (roi_debug[outside].astype(np.float32) * 0.25).astype(np.uint8)
+    cv2.drawContours(roi_debug, contours, -1, (0, 255, 255), 1)
+
+    # Detection debug: original image + green circle around ball only
+    det_debug = bgr.copy()
+    if best_cent is not None:
+        cx_i, cy_i = int(round(best_cent[0])), int(round(best_cent[1]))
+        r_i = max(4, int(round(best_r)) + 4)
+        cv2.circle(det_debug, (cx_i, cy_i), r_i, (0, 255, 0), 2)
+        cv2.circle(det_debug, (cx_i, cy_i), 2, (0, 0, 255), -1)
+
+    return best_cent, mask_debug, roi_debug, det_debug
+
+
 def find_white_ball_centroid_near_click_for_pick(
     ball_bgr: np.ndarray,
     wheel_cx: float,

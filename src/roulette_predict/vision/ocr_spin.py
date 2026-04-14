@@ -12,7 +12,7 @@ import numpy as np
 # Same digit still visible in Step-3 ROI after a brief OCR miss used to re-log immediately.
 # Require this many seconds between two history entries with the **same** value (blocks glitches;
 # two real spins both e.g. 32 are usually farther apart than this on live/auto wheels).
-SAME_NUMBER_REPEAT_MIN_SEC = 10.0
+SAME_NUMBER_REPEAT_MIN_SEC = 25.0
 
 
 def preprocess_ocr_roi(bgr: np.ndarray) -> np.ndarray:
@@ -67,6 +67,23 @@ def _pick_best_attempt(attempts: list[tuple[str, Optional[int]]]) -> Optional[tu
 def _pick_best_parse(attempts: list[tuple[str, Optional[int]]]) -> Optional[int]:
     b = _pick_best_attempt(attempts)
     return b[1] if b else None
+
+
+def _pick_majority_2digit(attempts: list[tuple[str, Optional[int]]]) -> Optional[tuple[str, int]]:
+    """Among 2-digit reads, return the value with the most votes (needs >=2 agreeing)."""
+    from collections import Counter
+
+    two_dig = [(raw, v) for raw, v in attempts if v is not None and _digit_run_len(raw) >= 2]
+    if len(two_dig) < 2:
+        return None
+    counts: Counter[int] = Counter(v for _, v in two_dig)
+    winner, n = counts.most_common(1)[0]
+    if n < 2:
+        return None
+    for raw, v in two_dig:
+        if v == winner:
+            return (raw, v)
+    return None
 
 
 def tesseract_digits(bgr: np.ndarray, tesseract_cmd: Optional[str] = None) -> str:
@@ -127,26 +144,44 @@ def _ocr_image_variants(bgr_patch: np.ndarray, *, quick: bool) -> list[np.ndarra
     scale = 4.2 if quick else 4.5
     kern = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     h_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 1))
+    v_dilate = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
     variants: list[np.ndarray] = []
 
-    def add_from_base(base: np.ndarray, *, use_plain_big: bool) -> None:
+    def add_from_base(base: np.ndarray, *, use_plain_big: bool, slim: bool = False) -> None:
         big = cv2.resize(base, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
         big = cv2.GaussianBlur(big, (3, 3), 0)
         bc = clahe.apply(big)
-        gimgs = (bc, big) if use_plain_big else (bc,)
+        if slim:
+            gimgs = (bc,)
+        else:
+            gimgs = (bc, big) if use_plain_big else (bc,)
         for gimg in gimgs:
             _, th_ot = cv2.threshold(gimg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             _, th_oi = cv2.threshold(gimg, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
             variants.append(th_ot)
             variants.append(th_oi)
-            variants.append(cv2.morphologyEx(th_ot, cv2.MORPH_CLOSE, kern))
-            variants.append(cv2.dilate(th_ot, h_dilate, iterations=1))
+            if not slim:
+                variants.append(cv2.morphologyEx(th_ot, cv2.MORPH_CLOSE, kern))
+                variants.append(cv2.dilate(th_ot, h_dilate, iterations=1))
+                variants.append(cv2.dilate(th_ot, v_dilate, iterations=1))
 
     # max(R,G,B) first — often best for white + red on dark pills
     add_from_base(mx, use_plain_big=not quick)
     add_from_base(r_dom, use_plain_big=False)
     add_from_base(gray, use_plain_big=not quick)
     add_from_base(vchan, use_plain_big=False)
+
+    # White-text isolation: low saturation + high value → white digits on dark bg
+    _, s_ch, _ = cv2.split(hsv)
+    white_iso = np.where((s_ch < 80) & (vchan > 150), vchan, np.uint8(0)).astype(np.uint8)
+    if np.count_nonzero(white_iso) > 10:
+        add_from_base(white_iso, use_plain_big=False, slim=quick)
+
+    # Sharpened gray preserves thin strokes ("7" in 17, curve of "6" in 36)
+    sharp_k = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]], dtype=np.float32)
+    sharpened = np.clip(cv2.filter2D(gray, -1, sharp_k), 0, 255).astype(np.uint8)
+    add_from_base(sharpened, use_plain_big=False, slim=quick)
+
     if not quick:
         add_from_base(255 - gray, use_plain_big=True)
         big = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
@@ -187,19 +222,28 @@ def _read_roulette_from_patch(
     attempts: list[tuple[str, Optional[int]]] = []
 
     if quick:
-        # Speed: try PSM 7 on all images first; stop early on a confident two-digit read.
+        from collections import Counter
+
+        td_counts: Counter[int] = Counter()
         for img in candidates:
             raw = ocr(img, 7)
-            attempts.append((raw, parse_roulette_int(raw)))
-            best = _pick_best_attempt(attempts)
-            if best is not None and _digit_run_len(best[0]) >= 2:
-                return best[0], best[1]
+            v = parse_roulette_int(raw)
+            attempts.append((raw, v))
+            if v is not None and _digit_run_len(raw) >= 2:
+                td_counts[v] += 1
+                if td_counts[v] >= 2:
+                    return raw, v
         for img in candidates:
             raw = ocr(img, 8)
-            attempts.append((raw, parse_roulette_int(raw)))
-            best = _pick_best_attempt(attempts)
-            if best is not None and _digit_run_len(best[0]) >= 2:
-                return best[0], best[1]
+            v = parse_roulette_int(raw)
+            attempts.append((raw, v))
+            if v is not None and _digit_run_len(raw) >= 2:
+                td_counts[v] += 1
+                if td_counts[v] >= 2:
+                    return raw, v
+        maj = _pick_majority_2digit(attempts)
+        if maj is not None:
+            return maj[0], maj[1]
         best = _pick_best_attempt(attempts)
         return (best[0], best[1]) if best else ("", None)
 
@@ -270,11 +314,15 @@ class SpinDebouncer:
     """Debounce OCR noise vs real new spins.
 
     • **First value ever** (``last_emitted is None``): emit on first clean parse (setup / cold start).
-    • **New digit** after that: if raw OCR has **two** digit chars (10–36), emit on **one** read (less lag).
-      Single-digit reads still need **two** consecutive parses (filters bogus “8” between 6 and 4).
+    • **New digit** after that: always requires **two consecutive** agreeing parses before emitting
+      (prevents one-off misreads like 36→35 or 17→1 from being recorded).
     • **Same digit again** (cell still shows the last logged number): never spam duplicates; only emit
       the same value twice if ``SAME_NUMBER_REPEAT_MIN_SEC`` has passed **and** two reads agree
       (covers the next spin landing on the same number, rare).
+
+    The OCR worker additionally gates feeding via **frame-change detection** — the debouncer
+    is not fed at all while the Step-3 rectangle image has not visually changed since the last
+    emission, which eliminates duplicate recordings entirely regardless of OCR noise.
     """
 
     pending_value: Optional[int] = None
@@ -305,10 +353,7 @@ class SpinDebouncer:
             self.pending_count = 1
 
         if v != self.last_emitted:
-            if self.last_emitted is None:
-                return self._emit(v, now)
-            dlen = _digit_run_len(raw_text)
-            if dlen >= 2:
+            if self.last_emitted is None and self.pending_count >= 1:
                 return self._emit(v, now)
             if self.pending_count >= 2:
                 return self._emit(v, now)

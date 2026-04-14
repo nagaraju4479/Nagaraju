@@ -160,9 +160,9 @@ class MainWindow(QMainWindow):
         self._color_preview.setMinimumSize(10, 10)
         self._color_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._color_preview.setStyleSheet("background-color: #000000; color: #888888; border: none;")
-        self._color_preview.setText("HSV masked preview")
+        self._color_preview.setText("Mask + ROI debug — waiting for capture")
         self._tabs.addTab(self._roulette_preview, "Roulette Detection")
-        self._tabs.addTab(self._color_preview, "Color Detection")
+        self._tabs.addTab(self._color_preview, "Mask / ROI Debug")
         left_l.addWidget(self._tabs)
 
         right_inner = QWidget()
@@ -250,15 +250,17 @@ class MainWindow(QMainWindow):
         hf_l.addWidget(hist_scroll)
         rl.addWidget(history_frame)
 
-        hdr_color = QLabel("COLOR DETECTION — mask (U-S + more)")
+        hdr_color = QLabel("BALL DETECTION — fixed white-ball HSV")
         hdr_color.setObjectName("sectionHeader")
         rl.addWidget(hdr_color)
         color_hint = QLabel(
-            "**Color / HSV:** The mask uses your **Step-2 tube path** plus sliders (**U-S**, **L-V**, **L-S**, etc.). "
-            "**Specular / lighting** can add white arcs or dots — raise **L-S** slightly to drop gray glints, tighten **U-S**, "
-            "or adjust **V** so only the ball + path stay white. If you darken until glints vanish, use **Pick ball color (click wheel)** "
-            "on **Roulette** to sample the ball and reopen a tight HSV cone. While tracking, the Color preview shows **one** blob (the target). "
-            "**Roulette** uses the same sliders; **flow** helps when glare competes with the ball. Run **Setup** to fix geometry."
+            "**Ball detection** now uses a **fixed HSV range** (H 0–180, S 0–50, V 210–255) tuned for a bright white/ivory ball "
+            "under strong lighting. Detection is restricted to the **outer circular track** (Step-1 wheel ∩ Step-2 tube). "
+            "Morphological open + close removes specular noise; only **small, circular** contours pass "
+            "(circularity > 0.7 via 4π·area/perimeter²). Reflections are larger or irregular and get rejected. "
+            "**Mask/ROI Debug** tab shows the binary mask (left) and the ring ROI with contour outlines (right). "
+            "**Roulette Detection** shows a green circle on the detected ball only. "
+            "HSV sliders below are for **reference tuning** only — they do not affect ball detection."
         )
         color_hint.setObjectName("hintMuted")
         color_hint.setWordWrap(True)
@@ -774,17 +776,18 @@ class MainWindow(QMainWindow):
         self._color_preview.setText("Waiting for setup completion…")
 
     def _set_hsv_ball_tune_default(self) -> None:
-        """Defaults tuned so the track-ring mask is not one huge blob (L-V rejects dark felt/ink)."""
+        """Set sliders to reference values matching the fixed white-ball detector."""
         self._sliders["L-H"].setValue(0)
         self._sliders["U-H"].setValue(179)
-        self._sliders["L-S"].setValue(22)
-        self._sliders["U-S"].setValue(200)
-        self._sliders["L-V"].setValue(130)
+        self._sliders["L-S"].setValue(0)
+        self._sliders["U-S"].setValue(50)
+        self._sliders["L-V"].setValue(210)
         self._sliders["U-V"].setValue(255)
         self._capture_hint.setText(
-            "Open **Color** tab: lower **U-S** so the tube path (and ideally the ball) show in the mask — not the whole ring. "
-            "Use **Show all HSV** to widen **H** / **L-V** / **U-V** if the ball is white but vanishes from the mask. "
-            "**Roulette** uses the same HSV live; green ring = tracked ball. **Flow** helps when color alone is ambiguous."
+            "Ball detection uses a **fixed HSV range** for white ball (no slider dependency). "
+            "Check **Roulette Detection** for the green circle on the ball. "
+            "**Mask/ROI Debug** shows the binary mask + ring ROI. "
+            "Sliders are for reference only and do **not** affect detection."
         )
 
     def _on_topmost(self, on: bool) -> None:

@@ -26,6 +26,7 @@ src/roulette_predict/vision/__init__.py
 src/roulette_predict/vision/ball_flow.py
 src/roulette_predict/vision/ball_track.py
 src/roulette_predict/vision/hsv_mask.py
+src/roulette_predict/vision/hsv_sample.py
 src/roulette_predict/vision/ocr_spin.py
 src/roulette_predict/vision/speed.py
 src/roulette_predict/vision/template_digits.py
@@ -34,6 +35,7 @@ tests/test_ball_roi_map.py
 tests/test_ball_track.py
 tests/test_geometry.py
 tests/test_hsv_mask.py
+tests/test_hsv_sample.py
 tests/test_ocr_pick.py
 tests/test_preview_speed_overlay.py
 tests/test_spin_debouncer.py

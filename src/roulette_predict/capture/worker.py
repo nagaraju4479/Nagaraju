@@ -19,16 +19,13 @@ from roulette_predict.vision.ball_flow import (
 from roulette_predict.vision.ball_track import (
     BALL_PATH_ROI_MARGIN,
     annulus_path_tube_mask_ball_roi,
-    ball_path_hsv_preview_mask,
-    ball_track_mask_and_centroid,
     centroid_in_track_annulus,
     centroid_near_step2_track_mask,
-    mask_keep_blob_at_tracked_centroid,
+    detect_white_ball,
     path_tube_mask_ball_roi,
     track_region_mask_ball_roi,
     wheel_center_radius_in_ball_roi,
 )
-from roulette_predict.vision.hsv_mask import apply_hsv_mask_bgr
 from roulette_predict.vision.ocr_spin import SpinDebouncer, read_roulette_number_live_fast
 from roulette_predict.vision.speed import SpeedTracker
 
@@ -39,6 +36,28 @@ def _bgr_to_qimage(bgr: np.ndarray) -> QImage:
     h, w = bgr.shape[:2]
     bgr = np.ascontiguousarray(bgr)
     return QImage(bgr.data, w, h, 3 * w, QImage.Format.Format_BGR888).copy()
+
+
+def _ocr_frame_fingerprint(bgr: np.ndarray) -> np.ndarray:
+    """Tiny grayscale thumbnail for fast frame-to-frame comparison."""
+    import cv2
+
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (24, 24), interpolation=cv2.INTER_AREA)
+
+
+def _ocr_frame_changed(
+    prev_fp: Optional[np.ndarray], curr_fp: np.ndarray, threshold: float = 8.0
+) -> bool:
+    """True when the OCR rectangle content has visibly changed since last emission."""
+    if prev_fp is None:
+        return True
+    if prev_fp.shape != curr_fp.shape:
+        return True
+    import cv2
+
+    diff = cv2.absdiff(prev_fp, curr_fp)
+    return float(np.mean(diff)) > threshold
 
 
 def _mss_monitor(monitor_index: int) -> dict:
@@ -344,22 +363,7 @@ class VisionWorker(QThread):
                 (self._WHEEL_PREVIEW_MAX_W, nh),
                 interpolation=cv2.INTER_AREA,
             )
-        mask, _ = apply_hsv_mask_bgr(
-            wheel_bgr,
-            self._hsv.l_h,
-            self._hsv.u_h,
-            self._hsv.l_s,
-            self._hsv.u_s,
-            self._hsv.l_v,
-            self._hsv.u_v,
-        )
-        mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-
         cx_b, cy_b, r_px = wheel_center_radius_in_ball_roi(cal, mon, bl, bt, bw, bh)
-        tune_lower = np.array([self._hsv.l_h, self._hsv.l_s, self._hsv.l_v], dtype=np.uint8)
-        tune_upper = np.array([self._hsv.u_h, self._hsv.u_s, self._hsv.u_v], dtype=np.uint8)
-        lower = tune_lower
-        upper = tune_upper
         bh, bw = ball_bgr.shape[0], ball_bgr.shape[1]
         tube_mask = path_tube_mask_ball_roi(bh, bw, cal)
         track_geom_mask = track_region_mask_ball_roi(bh, bw, cx_b, cy_b, r_px, tube_mask)
@@ -370,19 +374,15 @@ class VisionWorker(QThread):
             eff_anchor = self._last_ball_cent_roi
             eff_anchor_w = 0.82
 
-        # Live HSV from Color sliders — baseline centroid; dense optical flow fuses for fast spin.
-        _, cent_hsv, _auto_ball = ball_track_mask_and_centroid(
+        # Fixed-HSV white-ball detector — no slider dependency; ring mask + morphology + circularity.
+        cent_hsv, mask_dbg, roi_dbg, det_dbg = detect_white_ball(
             ball_bgr,
             cx_b,
             cy_b,
             r_px,
-            lower,
-            upper,
-            prefer_manual=True,
-            anchor_ball_xy=eff_anchor,
-            anchor_weight=eff_anchor_w,
-            allow_auto_fallback=False,
             tube_mask=tube_mask,
+            anchor_xy=eff_anchor,
+            anchor_weight=eff_anchor_w,
         )
         t_now = time.perf_counter()
         cent: Optional[Tuple[float, float]] = cent_hsv
@@ -461,11 +461,6 @@ class VisionWorker(QThread):
             self._viz_cent_miss_streak += 1
             if self._ring_coast_frames_left > 0:
                 self._ring_coast_frames_left -= 1
-        bmask_display = ball_path_hsv_preview_mask(
-            ball_bgr, cx_b, cy_b, r_px, lower, upper, tube_mask=tube_mask
-        )
-        if cent is not None:
-            bmask_display = mask_keep_blob_at_tracked_centroid(bmask_display, cent)
         omega_out = 0.0
         if cent and self._speed_tracker:
             omega = self._speed_tracker.update(time.perf_counter(), cent[0], cent[1])
@@ -490,8 +485,6 @@ class VisionWorker(QThread):
         sx = wheel_bgr.shape[1] / float(ww)
         sy = wheel_bgr.shape[0] / float(wh)
         wheel_out = wheel_bgr.copy()
-        # Wheel-tab mask preview (path + ball in range); Color tab uses ball-path ROI only below.
-        mask_wheel = mask_bgr.copy()
         if cent_draw is not None:
             bx = int((bl + cent_draw[0] - wl) * sx)
             by = int((bt + cent_draw[1] - wt) * sy)
@@ -499,17 +492,16 @@ class VisionWorker(QThread):
                 r_ball = max(8, min(18, wheel_out.shape[0] // 45))
                 edge = (0, 255, 0) if ring_use_green else (0, 200, 255)
                 cv2.circle(wheel_out, (bx, by), r_ball, edge, 3)
-                cv2.circle(mask_wheel, (bx, by), 16, edge, 2)
 
-        ball_vis = cv2.cvtColor(bmask_display, cv2.COLOR_GRAY2BGR)
-        color_h = wheel_out.shape[0]
-        color_w = max(1, int(bw * color_h / max(1, bh)))
-        color_out = cv2.resize(ball_vis, (color_w, color_h), interpolation=cv2.INTER_NEAREST)
-        if cent_draw is not None and bw > 0 and bh > 0:
-            cx = int(cent_draw[0] * color_w / bw)
-            cy = int(cent_draw[1] * color_h / bh)
-            ccol = (0, 255, 0) if ring_use_green else (0, 200, 255)
-            cv2.circle(color_out, (cx, cy), max(8, min(20, color_h // 12)), ccol, 2)
+        # Color Detection tab: mask (left) | ROI (right) side-by-side debug composite.
+        target_h = wheel_out.shape[0]
+        mask_h, mask_w = mask_dbg.shape[:2]
+        roi_h, roi_w = roi_dbg.shape[:2]
+        mw = max(1, int(mask_w * target_h / max(1, mask_h)))
+        rw = max(1, int(roi_w * target_h / max(1, roi_h)))
+        m_resized = cv2.resize(mask_dbg, (mw, target_h), interpolation=cv2.INTER_NEAREST)
+        r_resized = cv2.resize(roi_dbg, (rw, target_h), interpolation=cv2.INTER_AREA)
+        color_out = np.hstack([m_resized, r_resized])
 
         self.frame_color.emit(_bgr_to_qimage(color_out))
         self.frame_wheel.emit(_bgr_to_qimage(wheel_out))
@@ -527,6 +519,7 @@ class OcrSpinWorker(QThread):
         self._cal: Optional[CalibrationData] = None
         self._debouncer = SpinDebouncer()
         self._tesseract_cmd: Optional[str] = None
+        self._last_emit_fp: Optional[np.ndarray] = None
 
     def set_tesseract_cmd(self, cmd: Optional[str]) -> None:
         if not cmd or not str(cmd).strip():
@@ -539,6 +532,7 @@ class OcrSpinWorker(QThread):
 
     def reset_spin_debounce(self) -> None:
         self._debouncer = SpinDebouncer()
+        self._last_emit_fp = None
 
     def seed_spin_debouncer_last_recorded(self, value: int) -> None:
         if 0 <= value <= 36:
@@ -564,11 +558,14 @@ class OcrSpinWorker(QThread):
                         else:
                             ocr_bgr = None
                     if ocr_bgr is not None and ocr_bgr.size > 0:
-                        raw_txt, _ = read_roulette_number_live_fast(ocr_bgr, self._tesseract_cmd)
-                        self.ocr_debug.emit(raw_txt)
-                        spin = self._debouncer.feed(raw_txt)
-                        if spin is not None:
-                            self.spin_detected.emit(spin)
+                        fp = _ocr_frame_fingerprint(ocr_bgr)
+                        if _ocr_frame_changed(self._last_emit_fp, fp):
+                            raw_txt, _ = read_roulette_number_live_fast(ocr_bgr, self._tesseract_cmd)
+                            self.ocr_debug.emit(raw_txt)
+                            spin = self._debouncer.feed(raw_txt)
+                            if spin is not None:
+                                self._last_emit_fp = fp
+                                self.spin_detected.emit(spin)
                 except Exception as e:
                     self.ocr_debug.emit(f"OCR error: {e}")
             else:
